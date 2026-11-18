@@ -1,0 +1,20 @@
+Reproducing ChaseGuard.asi
+==========================
+Needs GNU binutils (as, ld, objcopy, nm) and python3 on Linux (or WSL).
+
+  1. Obtain the base build of MWCrashFix (the build that includes the
+     exception handler, PE timestamp 2025-02-15) and save it here as orig.asi.
+     Its SHA-256 must be:
+       df66b419871fbc705d2de093613b4dffc72db5446c5778994c28d7186ff701a6
+  2. Run:  bash build.sh
+  3. The result, ChaseGuard.asi, must have SHA-256:
+       d462c1b6e40d63f45212aad5275cbbe0179e1fa9c913aaa259cab12a767a4a77
+
+Files
+  caves.s    new code placed in unused padding at the end of .text
+  patch.py   applies the patches, fixes the relocation table and section sizes
+  rename.py  length-preserving rename MWCrashFix -> ChaseGuard
+  build.sh   runs the steps above
+
+Original project and source: https://github.com/x0reaxeax/MWCrashFix
+License of these scripts: GPL-3.0 (see ../LICENSE.txt)
