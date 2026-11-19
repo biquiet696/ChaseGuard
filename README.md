@@ -5,8 +5,11 @@
 Pursuit crash protection for **Need for Speed: Most Wanted (2005), v1.3** – an ASI plugin that prevents the
 `Debug Error: R6025 - pure virtual function call` crash in long pursuits and adds a guarded crash-recovery layer.
 
-ChaseGuard is a **fork of [MWCrashFix](https://github.com/x0reaxeax/MWCrashFix) by x0reaxeax**, based on its build
-that includes the exception handler (PE timestamp 2025-02-15). Same patch table, safer behaviour.
+ChaseGuard is a **fork of [MWCrashFix](https://github.com/x0reaxeax/MWCrashFix) by x0reaxeax**, based on his official
+[release-1.2-veh-experimental](https://github.com/x0reaxeax/MWCrashFix/releases/tag/release-1.2-veh-experimental) build (2025-02-15; source: branch [`veh-experimental`](https://github.com/x0reaxeax/MWCrashFix/tree/veh-experimental)).
+Same patch table, safer behaviour.
+
+> The original release is marked *USE AT YOUR OWN RISK* by its author; the same applies to ChaseGuard.
 
 ## What it does
 
@@ -26,6 +29,15 @@ that includes the exception handler (PE timestamp 2025-02-15). Same patch table,
 - Renamed MWCrashFix → ChaseGuard (file, DLL name, log, message-box titles).
 
 Full list: [CHANGELOG.md](CHANGELOG.md).
+
+## Where the changes come from
+
+Relation to the base source (`veh-experimental`, `MWCrashFix/dllmain.c`):
+
+- `PatchRefs()` returns `VOID`: after a failed instruction check or `VirtualProtect` it shows a box and returns, and `DllMain()` then logs "Patched…" and installs the handler anyway.
+- `DllMain()` returns `EXIT_FAILURE` (which is `1`, i.e. `TRUE`) when the log file cannot be opened: the DLL loads, but nothing is patched.
+- `VectoredHandler()` acts on every access violation in the process, tests only `PAGE_EXECUTE_READ`, and decodes at the fault address before checking the page.
+- `DumpAndExit()` prints the register dump to `stderr`.
 
 ## Install
 
@@ -55,12 +67,12 @@ reproduce it byte for byte (see [`source/BUILD.txt`](source/BUILD.txt)):
 
 | File | SHA-256 |
 |------|---------|
-| base build (`orig.asi`) | `df66b419871fbc705d2de093613b4dffc72db5446c5778994c28d7186ff701a6` |
+| base build (`orig.asi` = [official release asset](https://github.com/x0reaxeax/MWCrashFix/releases/tag/release-1.2-veh-experimental)) | `df66b419871fbc705d2de093613b4dffc72db5446c5778994c28d7186ff701a6` |
 | `ChaseGuard.asi` 1.0 | `d462c1b6e40d63f45212aad5275cbbe0179e1fa9c913aaa259cab12a767a4a77` |
 
 ## Credits
 
-- **MWCrashFix** – original idea, patch table and exception handler: [x0reaxeax](https://github.com/x0reaxeax/MWCrashFix) ([NFSMods page](https://nfsmods.xyz/mod/5970))
+- **MWCrashFix** – original idea, patch table and exception handler: [x0reaxeax](https://github.com/x0reaxeax/MWCrashFix) ([NFSMods page](https://nfsmods.xyz/mod/5970), [base release](https://github.com/x0reaxeax/MWCrashFix/releases/tag/release-1.2-veh-experimental))
 - Related: [mwfixes](https://github.com/GrimMaple/mwfixes) by GrimMaple
 - The DLL statically contains the [Zydis](https://github.com/zyantific/zydis) disassembler library (Zyantific; MIT License)
 
