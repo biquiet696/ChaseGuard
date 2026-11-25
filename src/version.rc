@@ -1,0 +1,29 @@
+#include "version.h"
+1 VERSIONINFO
+FILEVERSION     CG_VERSION_MAJOR, CG_VERSION_MINOR, CG_VERSION_PATCH, 0
+PRODUCTVERSION  CG_VERSION_MAJOR, CG_VERSION_MINOR, CG_VERSION_PATCH, 0
+FILEFLAGSMASK   0x3F
+FILEFLAGS       0
+FILEOS          0x40004
+FILETYPE        2
+FILESUBTYPE     0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName",      "biquiet696"
+      VALUE "FileDescription",  "ChaseGuard - pursuit crash protection for NFS Most Wanted (2005) v1.3"
+      VALUE "FileVersion",      CG_VERSION_STR
+      VALUE "InternalName",     "ChaseGuard"
+      VALUE "LegalCopyright",   "GPL-3.0-or-later. Based on MWCrashFix by x0reaxeax. Zydis (MIT) by zyantific."
+      VALUE "OriginalFilename", "ChaseGuard.asi"
+      VALUE "ProductName",      "ChaseGuard"
+      VALUE "ProductVersion",   CG_VERSION_STR
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

@@ -1,0 +1,31 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm
+      - name: Build ChaseGuard.asi
+        run: ./build.sh
+      - name: Check the import table (kernel32 and user32 only)
+        run: |
+          llvm-readobj --coff-imports build/ChaseGuard.asi | grep 'Name:' | sort -u | tee imports.txt
+          ! grep -v -E 'kernel32.dll|user32.dll' imports.txt
+      - name: Package
+        run: |
+          mkdir -p pkg/scripts
+          cp build/ChaseGuard.asi dist/ChaseGuard.ini pkg/scripts/
+          cp README.md CHANGELOG.md LICENSE pkg/
+          cp third_party/zydis/LICENSE pkg/LICENSE-Zydis.txt
+          (cd pkg && zip -r ../ChaseGuard.zip .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChaseGuard
+          path: ChaseGuard.zip

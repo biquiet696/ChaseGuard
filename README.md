@@ -2,81 +2,114 @@
 
 # ChaseGuard
 
-Pursuit crash protection for **Need for Speed: Most Wanted (2005), v1.3** – an ASI plugin that prevents the
-`Debug Error: R6025 - pure virtual function call` crash in long pursuits and adds a guarded crash-recovery layer.
+Pursuit crash protection for **Need for Speed: Most Wanted (2005), v1.3**: an ASI plugin that prevents the
+`Debug Error: R6025 - pure virtual function call` crash in long pursuits and adds a careful crash-recovery layer.
 
-ChaseGuard is a **fork of [MWCrashFix](https://github.com/x0reaxeax/MWCrashFix) by x0reaxeax**, based on his official
-[release-1.2-veh-experimental](https://github.com/x0reaxeax/MWCrashFix/releases/tag/release-1.2-veh-experimental) build (2025-02-15; source: branch [`veh-experimental`](https://github.com/x0reaxeax/MWCrashFix/tree/veh-experimental)).
-Same patch table, safer behaviour.
+ChaseGuard started as a fork of [MWCrashFix](https://github.com/x0reaxeax/MWCrashFix) by x0reaxeax
+([release-1.2-veh-experimental](https://github.com/x0reaxeax/MWCrashFix/releases/tag/release-1.2-veh-experimental)).
+Version 2.0 is a rewrite from source: the same patch table, a new exception handler.
 
-> The original release is marked *USE AT YOUR OWN RISK* by its author; the same applies to ChaseGuard.
-
-## What it does
-
-1. Patches 434 instructions in `speed.exe` so the faulty pursuit event pointer (`0x890970`) is replaced by another one
-   (`0x8aa828`). Every location is verified against the expected bytes before it is written.
-2. Installs an exception handler that can recover from certain access violations raised by the game's own code.
-   It ignores everything that does not come from the game.
-
-## What is different from the base build
-
-- A failed instruction check / `VirtualProtect` now **exits cleanly** instead of falling through, logging "Patched…" and installing the handler anyway.
-- The handler only reacts to faults whose address (or return address) is **inside the game image** (`0x00401000–0x00FFFFFF`); everything else is passed on untouched.
-- Executable-page test accepts **all executable protections**, not only `PAGE_EXECUTE_READ`.
-- No more second fault inside the disassembler when the game jumps to non-executable memory.
-- The crash register dump goes to **`chaseguard.log`** (it went to `stderr` before).
-- If the log file cannot be created, the patches are **still applied** (log falls back to `NUL`).
-- Renamed MWCrashFix → ChaseGuard (file, DLL name, log, message-box titles).
-
-Full list: [CHANGELOG.md](CHANGELOG.md).
-
-## Where the changes come from
-
-Relation to the base source (`veh-experimental`, `MWCrashFix/dllmain.c`):
-
-- `PatchRefs()` returns `VOID`: after a failed instruction check or `VirtualProtect` it shows a box and returns, and `DllMain()` then logs "Patched…" and installs the handler anyway.
-- `DllMain()` returns `EXIT_FAILURE` (which is `1`, i.e. `TRUE`) when the log file cannot be opened: the DLL loads, but nothing is patched.
-- `VectoredHandler()` acts on every access violation in the process, tests only `PAGE_EXECUTE_READ`, and decodes at the fault address before checking the page.
-- `DumpAndExit()` prints the register dump to `stderr`.
+> Like the original, ChaseGuard is provided *as is* - use at your own risk.
 
 ## Install
 
-Requirements: NFS Most Wanted (2005) `speed.exe` v1.3, an ASI loader (the game must load `*.asi` from `scripts`),
-Microsoft Visual C++ Redistributable 2015–2022 **x86**.
+Requirements: NFS Most Wanted (2005) `speed.exe` **v1.3** and an ASI loader that loads `*.asi` from `scripts`
+(for example [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) as `dinput8.dll`).
+No Visual C++ Redistributable is needed.
 
-1. Delete any old `MWCrashFix.asi` from `<game folder>\scripts` – do **not** keep both.
-2. Copy `ChaseGuard.asi` (from the [Releases](../../releases) page) into `<game folder>\scripts`.
-3. Start the game. Uninstall = delete the file.
+1. Delete `MWCrashFix.asi` from `<game folder>\scripts` if you have it. Do **not** keep both.
+2. Copy `ChaseGuard.asi` and `ChaseGuard.ini` from the release zip into `<game folder>\scripts`.
+3. Start the game. To uninstall, delete both files.
 
-`chaseguard.log` appears next to the game and grows with every launch (safe to delete). Lines starting with
-`Faulting address` mean the handler caught a crash in game code – please attach the log to bug reports.
+`chaseguard.log` is written to the game folder. It starts over when it is larger than `MaxLogKB` at game start.
 
-Works together with GrimMaple's [mwfixes](https://github.com/GrimMaple/mwfixes) (as documented for MWCrashFix);
-its "Roadblock spawn problem fix" becomes redundant.
+## What it does
+
+**1. The patch.** 434 instructions in `speed.exe` store `0x890970` into an object. That value is the virtual table
+of the base class of the game's event-subscriber objects. An object carries it only while its constructor registers
+it (`0x5D7930`) or its destructor unregisters it (`0x5D5A50`). If a virtual call reaches the object in that window,
+the game dies with R6025. Like MWCrashFix, ChaseGuard stores `0x8AA828` instead, a table whose entries are harmless
+accessors. Before the first byte is written, **all 434 locations are verified**. On an unknown or modified
+`speed.exe` nothing is changed, and if writing fails halfway everything is rolled back.
+
+**2. The exception handler.** It handles an access violation only when it can prove from the instructions that
+the fault comes from game code, and only in these cases:
+
+| Situation | What ChaseGuard does |
+|---|---|
+| A game instruction reads/writes through a broken pointer (`mov eax, [ecx+8]`, `ecx` dangling) | skips the instruction; a load clears the target register, so the game's own null checks take over |
+| `call [bad pointer]` in game code | skips the call, the call "returns" `0` in `EAX` |
+| A game `call` jumped into non-executable memory (corrupted function pointer) | returns to the caller with `EAX = 0`, but only if the bytes before the return address decode to a `CALL` whose operand really points to the faulting address |
+| `push`/`pop`/`ret`/`jmp`/anything that changes `ESP` faults | **not** touched (skipping would corrupt the stack); the game crashes as without the plugin |
+| A fault anywhere else (drivers, other mods, Windows) | **not** touched and not logged |
+| The same place faults more than `LoopLimit` times per second | stops recovering there, so the game crashes instead of freezing |
+
+When ChaseGuard does not recover, it passes the exception on. Windows and other crash handlers see the original
+crash, and `chaseguard.log` gets a register dump.
+
+## Settings (`ChaseGuard.ini`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `EnablePatch` | 1 | apply the 434-location patch |
+| `EnableHandler` | 1 | install the exception handler |
+| `RecoverFaults` | 1 | skip game instructions that access a broken pointer |
+| `RecoverBadCalls` | 1 | recover from calls through / into broken pointers |
+| `ZeroLoadedRegister` | 1 | clear the register a skipped load would have written |
+| `LoopLimit` | 500 | recoveries per second at one address before giving up there |
+| `MaxLogKB` | 1024 | log size limit |
+| `SelfTest` | 0 | `1` = 10 s after start, provoke three harmless faults in game code and log PASS/FAIL |
+
+## Reading the log
+
+```
+recovered #1 at 00402510: load from bad pointer skipped, register = 0 (skip-instruction read 0000001A, register cleared) [1 at this address]
+Faulting address 0061234A in game code, not recovered: control-flow/stack instruction cannot be skipped (read 00000004)
+```
+
+`recovered` lines mean a crash was prevented. `not recovered` lines are followed by registers, stack and code
+bytes. Please attach `chaseguard.log` to bug reports.
 
 ## Known limitations
 
-- No rollback if a mismatch is found in the middle of the patch table (on a wrong `speed.exe` the first check fails, so nothing is written).
-- The handler's "return from a bad call" emulation is exact only for calls where the caller cleans the stack.
-- Tested for several hours together with other mods without crashes – not a guarantee; feedback is welcome.
+- `speed.exe` v1.3 only.
+- After a recovered *call*, the caller gets `0` instead of a real result. Arguments that a `__thiscall`/`__stdcall`
+  callee would have removed stay on the stack. The game usually copes; this is the same trade-off as in MWCrashFix,
+  and the reason ChaseGuard only does it for verified call sites.
+- A skipped x87 load (`fld [bad]`) leaves the FPU stack one entry short, as in MWCrashFix.
+- Recovery keeps the game running, it does not make broken game state correct. If a career save matters to you,
+  keep a backup.
 
-## How it was built
+## Building
 
-ChaseGuard 1.0 is a **binary-patched derivative** of the base build, not a recompile. The scripts in [`source/`](source)
-reproduce it byte for byte (see [`source/BUILD.txt`](source/BUILD.txt)):
+On Linux (or WSL) with LLVM. No Windows SDK, no MSVC and no C runtime are needed:
 
-| File | SHA-256 |
-|------|---------|
-| base build (`orig.asi` = [official release asset](https://github.com/x0reaxeax/MWCrashFix/releases/tag/release-1.2-veh-experimental)) | `df66b419871fbc705d2de093613b4dffc72db5446c5778994c28d7186ff701a6` |
-| `ChaseGuard.asi` 1.0 | `d462c1b6e40d63f45212aad5275cbbe0179e1fa9c913aaa259cab12a767a4a77` |
+```sh
+sudo apt install clang lld llvm
+./build.sh                       # -> build/ChaseGuard.asi
+tests/run_tests.sh /path/to/speed.exe   # decision-logic tests against the real game code
+```
+
+The build is reproducible: the same sources produce the same `ChaseGuard.asi` byte for byte. GitHub Actions builds
+every push (`.github/workflows/build.yml`).
+
+| Path | Content |
+|---|---|
+| `src/chaseguard.c` | entry point, patcher, exception handler, log, settings, self-test |
+| `src/core.c` | platform-independent decision logic (also compiled into the tests) |
+| `src/sites.inc` | the 434 patch locations, generated by `tools/gen_sites.py` from MWCrashFix |
+| `tests/` | 57 checks on real `speed.exe` code, plus a decoder cross-check over all 1.8 M instructions of `.text` |
+| `third_party/zydis/` | Zydis 4.1 instruction decoder (MIT) |
 
 ## Credits
 
-- **MWCrashFix** – original idea, patch table and exception handler: [x0reaxeax](https://github.com/x0reaxeax/MWCrashFix) ([NFSMods page](https://nfsmods.xyz/mod/5970), [base release](https://github.com/x0reaxeax/MWCrashFix/releases/tag/release-1.2-veh-experimental))
+- **MWCrashFix**: original discovery, patch table and the idea of the exception handler, by
+  [x0reaxeax](https://github.com/x0reaxeax/MWCrashFix) ([NFSMods page](https://nfsmods.xyz/mod/5970))
 - Related: [mwfixes](https://github.com/GrimMaple/mwfixes) by GrimMaple
-- The DLL statically contains the [Zydis](https://github.com/zyantific/zydis) disassembler library (Zyantific; MIT License)
+- [Zydis](https://github.com/zyantific/zydis) by zyantific (MIT License, see `third_party/zydis/LICENSE`)
 
 ## License
 
-[GPL-3.0](LICENSE), like the original project. This is a modified version of MWCrashFix (first modified release: 2026-11-19).
-Not affiliated with or endorsed by Electronic Arts. "Need for Speed" is a trademark of Electronic Arts Inc.
+[GPL-3.0](LICENSE), like the original project. This is a modified version of MWCrashFix (first modified release
+2026-11-19, rewritten 2026-11-25). Not affiliated with or endorsed by Electronic Arts. "Need for Speed" is a
+trademark of Electronic Arts Inc.
