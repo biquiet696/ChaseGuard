@@ -16,3 +16,6 @@ if command -v llvm-objdump >/dev/null 2>&1; then
 else
   build/tests/test_core "$EXE"
 fi
+echo
+echo "stubs for calls on destroyed interfaces (native 32-bit run):"
+python3 tests/test_stubs.py

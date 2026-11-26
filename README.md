@@ -25,14 +25,27 @@ No Visual C++ Redistributable is needed.
 
 ## What it does
 
-**1. The patch.** 434 instructions in `speed.exe` store `0x890970` into an object. That value is the virtual table
-of the base class of the game's event-subscriber objects. An object carries it only while its constructor registers
-it (`0x5D7930`) or its destructor unregisters it (`0x5D5A50`). If a virtual call reaches the object in that window,
-the game dies with R6025. Like MWCrashFix, ChaseGuard stores `0x8AA828` instead, a table whose entries are harmless
-accessors. Before the first byte is written, **all 434 locations are verified**. On an unknown or modified
-`speed.exe` nothing is changed, and if writing fails halfway everything is rolled back.
+**1. What causes R6025.** `0x890970` is the virtual table of the game's interface base class (EA's COM-style
+interfaces). The constructor `0x401F10` registers an interface with its owner object as a `{type, pointer}` pair
+(`0x5D7930`); every destructor stores `0x890970` back and unregisters it (`0x5D5A50`). That table has a single
+slot, the destructor: slots 1-8 are floats and slot 9 onwards is `_purecall`. So R6025 is a **virtual call on an
+interface that was already destroyed**: some game code keeps a pointer to it after its owner deleted it.
 
-**2. The exception handler.** It handles an access violation only when it can prove from the instructions that
+**2. The patch.** 434 instructions in `speed.exe` store `0x890970`. MWCrashFix stores `0x8AA828` instead, the table
+of an unrelated class: the stale call then runs a real method of that class on freed memory (some of them write into
+it). ChaseGuard stores **its own table** (`PatchMode=2`): slot 0 is the game's real destructor, every other slot logs
+the call and returns `0` without touching the dead object, removes the callee's arguments and pushes `0.0` when the
+caller expects a float. `PatchMode=0` is exactly MWCrashFix. Before the first byte is written, **all 434 locations are
+verified**. On an unknown or modified `speed.exe` nothing is changed, and if writing fails halfway everything is
+rolled back.
+
+**3. The registry fix.** The game's unregister function is `v.erase(std::remove(v.begin(), v.end(), x))` with the
+one-argument `erase`: an interface listed twice leaves a dangling pointer in its owner, one that is not listed makes
+the copy loop overwrite the heap past the end of the vector. ChaseGuard replaces it with a correct version and logs
+both cases. It also remembers the last 1024 destroyed interfaces, so every call on a dead one is logged with what
+it was: type, owner, the destructor that removed it, how long ago, and whether the owner still lists it.
+
+**4. The exception handler.** It handles an access violation only when it can prove from the instructions that
 the fault comes from game code, and only in these cases:
 
 | Situation | What ChaseGuard does |
@@ -48,7 +61,7 @@ the fault comes from game code, and only in these cases:
 When ChaseGuard does not recover, it passes the exception on. Windows and other crash handlers see the original
 crash, and `chaseguard.log` gets a register dump.
 
-**3. Exit diagnostics.** Every way the game ends is logged with the game call stack: a normal quit (exit code 0),
+**5. Exit diagnostics.** Every way the game ends is logged with the game call stack: a normal quit (exit code 0),
 any C runtime error box (`R6025`, `R6018`, ...; `speed.exe` uses the debug CRT, so these appear as "Microsoft
 Visual C++ Debug Library - Debug Error!"), and unhandled crashes with the module they happened in (game, driver,
 another mod). If the game closes itself without an error, the log names the path that asked it to quit
@@ -59,6 +72,8 @@ another mod). If the game closes itself without an error, the log names the path
 | Key | Default | Meaning |
 |---|---|---|
 | `EnablePatch` | 1 | apply the 434-location patch |
+| `PatchMode` | 2 | `2` = ChaseGuard table, calls on destroyed interfaces return `0`; `1` = ChaseGuard table, forwarded to the MWCrashFix method; `0` = MWCrashFix table `0x8AA828`, no logging |
+| `FixInterfaceRegistry` | 1 | replace the game's broken interface unregister function |
 | `EnableHandler` | 1 | install the exception handler |
 | `RecoverFaults` | 1 | skip game instructions that access a broken pointer |
 | `RecoverBadCalls` | 1 | recover from calls through / into broken pointers |
@@ -67,7 +82,7 @@ another mod). If the game closes itself without an error, the log names the path
 | `ZeroLoadedRegister` | 1 | clear the register a skipped load would have written |
 | `LoopLimit` | 500 | recoveries per second at one address before giving up there |
 | `MaxLogKB` | 1024 | log size limit |
-| `SelfTest` | 0 | `1` = 10 s after start, provoke four harmless faults in game code and log PASS/FAIL, including an exact stack-balance check |
+| `SelfTest` | 0 | `1` = 10 s after start, provoke five harmless faults in game code and log PASS/FAIL, including an exact stack-balance check |
 
 ## Reading the log
 
@@ -77,6 +92,9 @@ Faulting address 0061234A in game code, not recovered: control-flow/stack instru
 ```
 
 ```
+call on a destroyed interface: slot 9 (+24) from 004FA2AD (speed.exe+FA2AD), this=0A3B1C40: returned 0, arguments removed [1 at this address]
+  object 0A3B1C40 was interface type 6C1E2A10 of owner 0A3B1000, destroyed by the code at 0041A2B7 1834 ms ago; the owner no longer lists it, so the caller kept its own copy of the pointer
+interface registry: interface was listed more than once (the original code would have left a dangling pointer in the owner) (owner 0A3B1000, interface 0A3B1C40, called from 0041A2B7) [1 so far]
 pure virtual function call (R6025) from 0058A123 (speed.exe+18A123), this=0A3B1C40 vtable=00890970: returned 0 to the caller [1 at this address]
 game exits with code 3 after R6025 pure virtual function call
 UNHANDLED EXCEPTION C0000005 at 6A2B1F00 (amdxx32.dll+1F00), read 00000010 - the game crashes here
@@ -96,6 +114,8 @@ reports.
   callee-cleaned calls in `speed.exe` it is exact for 88.7 %; for the rest the stack can still be off. MWCrashFix
   and ChaseGuard 2.0 never corrected it.
 - A skipped x87 load (`fld [bad]`) leaves the FPU stack one entry short, as in MWCrashFix.
+- `PatchMode=2` stops the dead object from being used, it does not find the code that keeps the stale pointer by
+  itself. The log does: the `object ... was interface type ...` lines name the destructor and the call site.
 - Recovery keeps the game running, it does not make broken game state correct. If a career save matters to you,
   keep a backup.
 

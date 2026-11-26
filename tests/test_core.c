@@ -316,6 +316,18 @@ static void test_arg_sizes(void)
     printf("  callee-cleaned direct calls: %u, exact %u (%.2f%%), not analysable %u\n",
            total, exact, 100.0 * exact / total, unknown);
     CHECK(total > 20000 && exact * 100 >= total * 85, "argument size accuracy below 85%%");
+    {   /* virtual calls: what a call on a destroyed interface (PatchMode=2) can do */
+        unsigned vcalls = 0, vknown = 0, vfloat = 0;
+        for (i = 0; i < g_nlines; i++) {
+            const char *c = strstr(g_lines[i].text, "\tcall\tdword ptr [e");
+            if (!c || !strchr(c, '+') || i + 1 >= g_nlines) continue;
+            vcalls++;
+            if (cg_call_arg_bytes(&e, g_lines[i].addr, &b)) vknown++;
+            if (cg_call_returns_float(&e, g_lines[i + 1].addr)) vfloat++;
+        }
+        printf("  virtual calls: %u, argument size known %u (%.1f%%), float result %u (%.1f%%)\n",
+               vcalls, vknown, 100.0 * vknown / vcalls, vfloat, 100.0 * vfloat / vcalls);
+    }
 }
 
 static void test_stack_correction(void)
@@ -385,6 +397,36 @@ static void test_lengths(const char *listing)
     CHECK(checked > 1000000 && bad == 0, "decoder mismatches: %u", bad);
 }
 
+static void test_float_results(void)
+{
+    cg_env e = env_default();
+    puts("F) float results after virtual calls");
+    CHECK(cg_call_returns_float(&e, 0x6692c1), "0x6692be call [eax+2Ch] then fstp: float");
+    CHECK(cg_call_returns_float(&e, 0x471fc2), "0x471fbf call [eax+18h] then fdivr: float");
+    CHECK(cg_call_returns_float(&e, 0x471fd5), "0x471fcf call [edx+94h] then fadd: float");
+    CHECK(!cg_call_returns_float(&e, 0x42a4a3), "0x42a4a0 call [edx+24h] then fld: not float");
+    CHECK(!cg_call_returns_float(&e, 0x4fa2b0), "0x4fa2ad call [eax+24h] then test al: not float");
+    CHECK(!cg_call_returns_float(&e, 0x417403), "0x417400 call [edx+24h] then mov ecx,[eax]: not float");
+    CHECK(!cg_call_returns_float(&e, 0x10), "address outside .text: not float");
+}
+
+static void test_iface_remove(void)
+{
+    cg_u32 v[12], found, type = 0, n;
+    puts("G) interface registry removal");
+    { cg_u32 a[] = { 1,0xA0, 2,0xB0, 3,0xC0 }; memcpy(v, a, sizeof(a)); }
+    n = cg_iface_remove(v, 3, 0xB0, &found, &type);
+    CHECK(n == 2 && found == 1 && type == 2 && v[1] == 0xA0 && v[3] == 0xC0, "one match removed, order kept");
+    { cg_u32 a[] = { 1,0xA0, 2,0xB0, 2,0xB0, 3,0xC0 }; memcpy(v, a, sizeof(a)); }
+    n = cg_iface_remove(v, 4, 0xB0, &found, &type);
+    CHECK(n == 2 && found == 2 && v[1] == 0xA0 && v[3] == 0xC0, "duplicate pair: both removed (game left one)");
+    { cg_u32 a[] = { 1,0xA0, 3,0xC0, 9,0x99 }; memcpy(v, a, sizeof(a)); }
+    n = cg_iface_remove(v, 2, 0xB0, &found, &type);
+    CHECK(n == 2 && found == 0 && v[4] == 9 && v[5] == 0x99, "no match: nothing written past the end");
+    n = cg_iface_remove(v, 0, 0xB0, &found, &type);
+    CHECK(n == 0 && found == 0, "empty list");
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "usage: %s speed.exe [objdump listing]\n", argv[0]); return 2; }
@@ -396,6 +438,8 @@ int main(int argc, char **argv)
     if (argc > 2) { test_lengths(argv[2]); load_listing(argv[2]); }
     test_arg_sizes();
     test_stack_correction();
+    test_float_results();
+    test_iface_remove();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail != 0;
 }

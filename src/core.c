@@ -303,6 +303,62 @@ int cg_call_before(const cg_env *env, cg_u32 ret, cg_u32 *call_site)
 }
 
 
+cg_u32 cg_iface_remove(cg_u32 *pairs, cg_u32 count, cg_u32 iface, cg_u32 *found, cg_u32 *type)
+{
+    cg_u32 r, w = 0;
+    *found = 0;
+    for (r = 0; r < count; r++) {
+        if (pairs[2 * r + 1] == iface) { ++*found; *type = pairs[2 * r]; continue; }
+        if (w != r) { pairs[2 * w] = pairs[2 * r]; pairs[2 * w + 1] = pairs[2 * r + 1]; }
+        w++;
+    }
+    return w;
+}
+
+/* x87 instructions that do not read ST(0): a load before any use means "no float result". */
+static int x87_is_load(ZydisMnemonic m)
+{
+    switch (m) {
+    case ZYDIS_MNEMONIC_FLD: case ZYDIS_MNEMONIC_FILD: case ZYDIS_MNEMONIC_FBLD:
+    case ZYDIS_MNEMONIC_FLDZ: case ZYDIS_MNEMONIC_FLD1: case ZYDIS_MNEMONIC_FLDPI:
+    case ZYDIS_MNEMONIC_FLDL2E: case ZYDIS_MNEMONIC_FLDL2T: case ZYDIS_MNEMONIC_FLDLG2:
+    case ZYDIS_MNEMONIC_FLDLN2: case ZYDIS_MNEMONIC_FNINIT: case ZYDIS_MNEMONIC_FLDENV:
+    case ZYDIS_MNEMONIC_FRSTOR: case ZYDIS_MNEMONIC_FFREE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int x87_is_control(ZydisMnemonic m)
+{
+    return m == ZYDIS_MNEMONIC_FLDCW || m == ZYDIS_MNEMONIC_FNSTCW || m == ZYDIS_MNEMONIC_FNSTSW ||
+           m == ZYDIS_MNEMONIC_FWAIT || m == ZYDIS_MNEMONIC_FNCLEX;
+}
+
+int cg_call_returns_float(const cg_env *env, cg_u32 ret)
+{
+    ZydisDecodedInstruction in;
+    ZydisDecodedOperand op[ZYDIS_MAX_OPERAND_COUNT];
+    cg_u32 a = ret;
+    int i;
+    if (!g_ready || !in_text(env, ret))
+        return 0;
+    for (i = 0; i < 12; i++) {
+        if (!decode(env, a, 15, &in, op))
+            return 0;
+        if (in.meta.isa_ext == ZYDIS_ISA_EXT_X87) {
+            if (x87_is_control(in.mnemonic)) { a += in.length; continue; }
+            return !x87_is_load(in.mnemonic);
+        }
+        if (in.meta.category == ZYDIS_CATEGORY_COND_BR || in.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+            in.meta.category == ZYDIS_CATEGORY_CALL || in.meta.category == ZYDIS_CATEGORY_RET)
+            return 0;
+        a += in.length;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------------------------------ */
 /* Argument size of a call, from the caller's code (see cg_call_arg_bytes in core.h).          */
 /* ------------------------------------------------------------------------------------------ */

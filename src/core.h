@@ -95,4 +95,18 @@ int cg_call_before(const cg_env *env, cg_u32 ret, cg_u32 *call_site);
  */
 int cg_call_arg_bytes(const cg_env *env, cg_u32 call_site, cg_u32 *bytes);
 
+/*
+ * Returns 1 if the code at ret (the return address of a call) uses a float result of the callee
+ * in ST(0) before loading anything onto the x87 stack. A substitute that skips such a callee
+ * must push 0.0 or the caller pops an empty FPU register.
+ */
+int cg_call_returns_float(const cg_env *env, cg_u32 ret);
+
+/*
+ * Removes every {type, interface} pair whose interface equals iface from an array of count
+ * pairs (what the game's 0x5D5A50 should do). Returns the new count; *found = pairs removed,
+ * *type = type of the last one removed (unchanged if none).
+ */
+cg_u32 cg_iface_remove(cg_u32 *pairs, cg_u32 count, cg_u32 iface, cg_u32 *found, cg_u32 *type);
+
 #endif

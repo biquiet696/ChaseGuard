@@ -17,11 +17,19 @@
 
 /*
  * 434 instructions "mov dword ptr [reg], 0x890970" in speed.exe v1.3. 0x890970 is the vtable of
- * the base class of the game's event-subscriber objects; it is stored in an object only while
- * its constructor registers it (0x5D7930) or its destructor unregisters it (0x5D5A50). A virtual
- * call that reaches such an object in that window ends in "R6025 pure virtual function call".
- * MWCrashFix replaces the value with 0x8AA828, a table whose entries are harmless accessors.
- * The table and both values are unchanged from MWCrashFix.
+ * the game's interface base class (an EA "UTL::COM" style interface): its constructor 0x401F10
+ * registers the interface with its owner object as a {type, pointer} pair (0x5D7930) and every
+ * destructor stores 0x890970 back and unregisters it (0x5D5A50). The table has a single slot (the
+ * destructor); slots 1-8 are floats and slot 9+ belong to the next table and are _purecall. So a
+ * virtual call on an interface that was already destroyed ends in "R6025 pure virtual function
+ * call" (or a call into a float address). Somebody in the game keeps a pointer to an interface
+ * after its owner destroyed it.
+ *
+ * MWCrashFix stores 0x8AA828 instead, a table of another class: the stale call then runs a
+ * method of that class on the freed object (some of them write to it). PatchMode=0 does exactly
+ * that. PatchMode=1/2 store ChaseGuard's own table instead: slot 0 is the real destructor, every
+ * other slot logs the call and either returns 0 without touching the object (2) or forwards to
+ * the MWCrashFix method (1).
  */
 typedef struct site { DWORD addr; BYTE size; BYTE modrm; } site;
 static const site k_sites[] = {
@@ -29,7 +37,10 @@ static const site k_sites[] = {
 };
 #define SITE_COUNT  (sizeof(k_sites) / sizeof(k_sites[0]))
 #define VALUE_OLD   0x00890970u
-#define VALUE_NEW   0x008AA828u
+#define VALUE_MWCF  0x008AA828u   /* MWCrashFix replacement table (69 code slots)         */
+#define MWCF_SLOTS  69u
+#define BASE_DTOR   0x00410290u   /* slot 0 of 0x890970                                     */
+#define DEAD_SLOTS  128u
 #define GAME_BASE   0x00400000u
 _Static_assert(SITE_COUNT == 434, "patch table must have 434 entries");
 
@@ -76,6 +87,8 @@ typedef struct config {
     int self_test;      /* exercise the handler once, 10 seconds after start */
     int recover_pure_calls; /* "R6025 pure virtual function call": return 0 instead of exiting */
     int correct_stack;  /* remove the arguments of a skipped callee from the stack */
+    int patch_mode;     /* 0 = MWCrashFix table, 1 = own table + forward, 2 = own table + return 0 */
+    int fix_registry;   /* replace the interface unregister function with a correct one */
 } config;
 
 static config g_cfg;
@@ -100,6 +113,8 @@ static void load_config(void)
     g_cfg.self_test         = ini_int("SelfTest", 0, 0, 1);
     g_cfg.recover_pure_calls = ini_int("RecoverPureCalls", 1, 0, 1);
     g_cfg.correct_stack     = ini_int("CorrectStack", 1, 0, 1);
+    g_cfg.patch_mode        = ini_int("PatchMode", 2, 0, 2);
+    g_cfg.fix_registry      = ini_int("FixInterfaceRegistry", 1, 0, 1);
 }
 
 /* Directory of a module path including the trailing backslash. */
@@ -289,26 +304,37 @@ typedef enum patch_state {
 
 static DWORD g_bad_site;
 
+__attribute__((used)) DWORD g_dead_vtable[DEAD_SLOTS];   /* filled by init_dead_vtable() */
+static DWORD g_patch_value;                               /* value stored at the 434 sites */
+static DWORD g_site_orig[SITE_COUNT];
+
 static patch_state apply_patch(void)
 {
-    DWORD i, n_old = 0, n_new = 0;
+    DWORD i, n_target = 0, v;
+    g_patch_value = g_cfg.patch_mode == 0 ? VALUE_MWCF : (DWORD)g_dead_vtable;
     for (i = 0; i < SITE_COUNT; i++) {
         const site *s = &k_sites[i];
         if (s->addr < g_text_begin || s->addr + s->size > g_text_end) { g_bad_site = s->addr; return PATCH_UNSUPPORTED; }
-        if (site_equals(s, VALUE_OLD)) n_old++;
-        else if (site_equals(s, VALUE_NEW)) n_new++;
-        else if (!g_bad_site) g_bad_site = s->addr;
+        if (site_equals(s, VALUE_OLD)) v = VALUE_OLD;
+        else if (site_equals(s, VALUE_MWCF)) v = VALUE_MWCF;
+        else if (site_equals(s, g_patch_value)) v = g_patch_value;
+        else { if (!g_bad_site) g_bad_site = s->addr; v = 0; }
+        g_site_orig[i] = v;
+        if (v == g_patch_value) n_target++;
     }
-    if (n_new == SITE_COUNT) return PATCH_ALREADY;
-    if (n_old + n_new != SITE_COUNT) return (n_old + n_new == 0) ? PATCH_UNSUPPORTED : PATCH_FOREIGN;
+    if (g_bad_site) {
+        for (i = 0; i < SITE_COUNT; i++) if (g_site_orig[i]) return PATCH_FOREIGN;
+        return PATCH_UNSUPPORTED;
+    }
+    if (n_target == SITE_COUNT) return PATCH_ALREADY;
     if (!g_cfg.enable_patch) return PATCH_DISABLED;
 
     /* Every site is verified before the first byte is written; a failure rolls back. */
     for (i = 0; i < SITE_COUNT; i++) {
-        if (site_equals(&k_sites[i], VALUE_NEW)) continue;
-        if (!write_site(&k_sites[i], VALUE_NEW)) {
+        if (g_site_orig[i] == g_patch_value) continue;
+        if (!write_site(&k_sites[i], g_patch_value)) {
             g_bad_site = k_sites[i].addr;
-            while (i-- > 0) write_site(&k_sites[i], VALUE_OLD);
+            while (i-- > 0) write_site(&k_sites[i], g_site_orig[i]);
             return PATCH_FAILED;
         }
     }
@@ -322,6 +348,8 @@ static patch_state apply_patch(void)
 typedef struct addr_stat {
     DWORD addr, window_start, window_count, total;
     int   given_up;
+    int   analysed, arg_known, returns_float;   /* call-site analysis cache (destroyed interfaces) */
+    cg_u32 arg_bytes;
 } addr_stat;
 
 #define STAT_SLOTS 64
@@ -347,6 +375,7 @@ static addr_stat *stat_for(DWORD addr)
     g_stats[victim].window_count = 0;
     g_stats[victim].total = 0;
     g_stats[victim].given_up = 0;
+    g_stats[victim].analysed = 0;
     return &g_stats[victim];
 }
 
@@ -457,6 +486,272 @@ out:
     g_owner_tid = 0;
     unlock();
     return ret;
+}
+
+/* ------------------------------------------------------------------------------------------ */
+/* Interfaces: registry fix, graveyard and the table for destroyed interfaces                  */
+/*                                                                                             */
+/* Owner objects keep their interfaces in a vector of {type, interface} pairs at owner+4 (begin)*/
+/* and owner+8 (end). 0x5D5A50 (thiscall owner, arg interface) removes one: it does            */
+/* v.erase(std::remove(v.begin(), v.end(), x)) - the one-argument erase. With one match that is */
+/* right; with two matches one stale pair stays behind (a dangling pointer the owner hands out  */
+/* later); with no match it erases end() and its copy loop runs off the end of the vector,     */
+/* overwriting the heap until it faults. ChaseGuard replaces the function with a correct one   */
+/* and records every unregistered interface, so a later call on it can say what it was.        */
+/* ------------------------------------------------------------------------------------------ */
+
+#define FN_UNREGISTER    0x005D5A50u
+#define FN_REGISTER      0x005D7930u
+#define FN_REGISTER_CONT 0x005D7937u   /* after "sub esp,8 ; mov eax,[esp+0Ch]" (7 bytes)     */
+
+static int write_code(DWORD addr, const void *src, DWORD n);
+static int bytes_equal(DWORD addr, const BYTE *b, DWORD n);
+static void module_of(DWORD addr, char *out, DWORD cap, DWORD *offset);
+static void log_game_stack(DWORD esp);
+
+typedef struct iface_pair { DWORD type, ptr; } iface_pair;
+typedef struct grave { DWORD iface, owner, type, caller, tick; } grave;
+#define GRAVE_SLOTS 1024u
+static grave g_graves[GRAVE_SLOTS];
+static volatile LONG g_grave_next;
+static DWORD g_reg_missing, g_reg_dupes, g_reg_double, g_dead_calls, g_dead_forwarded;
+static int   g_registry_fixed;
+
+static void grave_add(DWORD iface, DWORD owner, DWORD type, DWORD caller)
+{
+    grave *g = &g_graves[(DWORD)__sync_fetch_and_add(&g_grave_next, 1) % GRAVE_SLOTS];
+    g->tick = GetTickCount();
+    g->iface = iface; g->owner = owner; g->type = type; g->caller = caller;
+}
+
+/* Newest record of an interface at this address, or 0. */
+static const grave *grave_find(DWORD iface)
+{
+    DWORD n = (DWORD)g_grave_next, i;
+    for (i = 0; i < GRAVE_SLOTS && i < n; i++) {
+        const grave *g = &g_graves[(n - 1 - i) % GRAVE_SLOTS];
+        if (g->iface == iface) return g;
+    }
+    return 0;
+}
+
+/* Counts how often iface is listed by owner. Hot path (every registration): reads directly,
+   the game's own code reads the same memory right after. */
+static int owner_lists_direct(DWORD owner, DWORD iface)
+{
+    const iface_pair *b = *(iface_pair **)(owner + 4), *e = *(iface_pair **)(owner + 8);
+    int cnt = 0;
+    if (e < b || (DWORD)(e - b) > 4096u) return 0;
+    for (; b < e; b++) cnt += b->ptr == iface;
+    return cnt;
+}
+
+/* The same for logging, on an owner that may be gone (-1 if it cannot be read). */
+static int owner_lists(DWORD owner, DWORD iface)
+{
+    DWORD be[2], i, n, cnt = 0;
+    iface_pair p;
+    if (!safe_read(0, owner + 4, be, 8) || be[1] < be[0] || (be[1] - be[0]) % 8) return -1;
+    n = (be[1] - be[0]) / 8;
+    if (n > 4096) return -1;
+    for (i = 0; i < n; i++) {
+        if (!safe_read(0, be[0] + i * 8, &p, 8)) return -1;
+        if (p.ptr == iface) cnt++;
+    }
+    return (int)cnt;
+}
+
+/* One log line about what a stale "this" pointer used to be. */
+static void log_object_origin(DWORD this_ptr)
+{
+    const grave *g = grave_find(this_ptr);
+    int listed;
+    if (!g) {
+        cg_log("  object %08lX is not among the last %u destroyed interfaces", this_ptr, GRAVE_SLOTS);
+        return;
+    }
+    listed = owner_lists(g->owner, this_ptr);
+    cg_log("  object %08lX was interface type %08lX of owner %08lX, destroyed by the code at %08lX %lu ms ago%s",
+           this_ptr, g->type, g->owner, g->caller, GetTickCount() - g->tick,
+           listed > 0 ? " - the owner STILL lists it (dangling registry entry)" :
+           listed == 0 ? "; the owner no longer lists it, so the caller kept its own copy of the pointer" :
+                         "; the owner is gone as well");
+}
+
+static void log_rare(DWORD *counter, const char *what, DWORD owner, DWORD iface, DWORD caller)
+{
+    DWORD n = ++*counter;
+    if (worth_logging(n))
+        cg_log("interface registry: %s (owner %08lX, interface %08lX, called from %08lX) [%lu so far]",
+               what, owner, iface, caller, n);
+}
+
+/* Replacement for 0x5D5A50: removes every pair of this interface, never touches memory
+   outside the vector. thiscall, one argument, "ret 4" - the same as the original. */
+__attribute__((thiscall, used)) void cg_unregister(DWORD owner, DWORD iface)
+{
+    DWORD caller = (DWORD)__builtin_return_address(0);
+    iface_pair *b = *(iface_pair **)(owner + 4), *e = *(iface_pair **)(owner + 8);
+    cg_u32 found = 0, type = 0, n;
+    if (e < b || (DWORD)(e - b) > 0x100000u) {
+        log_rare(&g_reg_missing, "owner has a broken interface list, left unchanged", owner, iface, caller);
+        return;
+    }
+    n = cg_iface_remove((cg_u32 *)b, (cg_u32)(e - b), iface, &found, &type);
+    *(iface_pair **)(owner + 8) = b + n;
+    grave_add(iface, owner, type, caller);
+    if (found == 0)
+        log_rare(&g_reg_missing, "unregistering an interface the owner does not list "
+                 "(the original code would have overwritten the heap here)", owner, iface, caller);
+    else if (found > 1)
+        log_rare(&g_reg_dupes, "interface was listed more than once (the original code would have "
+                 "left a dangling pointer in the owner)", owner, iface, caller);
+}
+
+__attribute__((used)) void __cdecl cg_on_register(DWORD owner, DWORD type, DWORD iface, DWORD caller)
+{
+    int n = owner_lists_direct(owner, iface);
+    if (n > 0)
+        log_rare(&g_reg_double, "interface registered again while still listed", owner, iface, caller);
+    (void)type;
+}
+
+/* Entry of 0x5D7930 (thiscall owner; args type, interface) jumps here. */
+__declspec(naked) static void register_stub(void)
+{
+    __asm__ volatile (
+        "pushl %ecx\n\t"
+        "pushl 4(%esp)\n\t"           /* caller    */
+        "pushl 16(%esp)\n\t"          /* interface */
+        "pushl 16(%esp)\n\t"          /* type      */
+        "pushl %ecx\n\t"              /* owner     */
+        "call  _cg_on_register\n\t"
+        "addl  $16, %esp\n\t"
+        "popl  %ecx\n\t"
+        "subl  $8, %esp\n\t"          /* the 7 replaced bytes */
+        "movl  12(%esp), %eax\n\t"
+        "pushl $0x005D7937\n\t"
+        "ret\n\t");
+}
+
+static void install_registry_fix(void)
+{
+    static const BYTE unreg[] = { 0x8B, 0x54, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x8B, 0x46, 0x08 };
+    static const BYTE reg[]   = { 0x83, 0xEC, 0x08, 0x8B, 0x44, 0x24, 0x0C };
+    BYTE jmp[7];
+    DWORD i;
+    int ok_u = 0, ok_r = 0;
+    if (!g_cfg.fix_registry) { cg_log("interface registry fix disabled in the ini (FixInterfaceRegistry=0)"); return; }
+    if (bytes_equal(FN_UNREGISTER, unreg, sizeof(unreg))) {
+        jmp[0] = 0xE9;
+        *(DWORD *)(jmp + 1) = (DWORD)cg_unregister - (FN_UNREGISTER + 5);
+        ok_u = write_code(FN_UNREGISTER, jmp, 5);
+    }
+    if (ok_u && bytes_equal(FN_REGISTER, reg, sizeof(reg))) {
+        jmp[0] = 0xE9;
+        *(DWORD *)(jmp + 1) = (DWORD)register_stub - (FN_REGISTER + 5);
+        for (i = 5; i < 7; i++) jmp[i] = 0xCC;
+        ok_r = write_code(FN_REGISTER, jmp, 7);
+    }
+    g_registry_fixed = ok_u;
+    cg_log("interface registry fix: unregister %s, register check %s", ok_u ? "replaced" : "NOT changed (code differs)",
+           ok_r ? "on" : "off");
+}
+
+/* ---- table for destroyed interfaces (PatchMode 1/2) ---- */
+
+/* Called by dead_common: frame[0] = slot, frame[1] = return address. Returns -1 to forward to
+   the MWCrashFix method, else the argument bytes to remove (bit 16 set: push 0.0 as well). */
+__attribute__((used)) int __cdecl on_dead_call(const DWORD *frame, DWORD this_ptr)
+{
+    DWORD slot = frame[0], ret = frame[1], mod_off;
+    cg_u32 site = 0, arg_bytes = 0;
+    int forward, known = 0, fl = 0, first;
+    char mod[64];
+    addr_stat *st;
+
+    cg_call_before(&g_env, ret, &site);
+    lock();
+    g_dead_calls++;
+    st = stat_for(site ? site : ret);
+    st->total++;
+    first = st->total <= 3;
+    if (!st->analysed) {
+        st->arg_known = site && cg_call_arg_bytes(&g_env, site, &st->arg_bytes);
+        st->returns_float = cg_call_returns_float(&g_env, ret);
+        st->analysed = 1;
+    }
+    forward = g_cfg.patch_mode == 1;
+    if (!forward && g_cfg.correct_stack) {
+        known = st->arg_known;
+        arg_bytes = st->arg_bytes;
+        if (!known) forward = 1;                     /* unknown stack effect: be MWCrashFix */
+    }
+    if (forward && slot >= MWCF_SLOTS) { forward = 0; arg_bytes = 0; known = 0; }
+    if (!forward) fl = st->returns_float;
+    if (forward) g_dead_forwarded++;
+    unlock();
+
+    if (st->total <= 10 || worth_logging(st->total)) {
+        module_of(site ? site : ret, mod, sizeof(mod), &mod_off);
+        cg_log("call on a destroyed interface: slot %lu (+%lX) from %08lX (%s+%lX), this=%08lX: %s [%lu at this address]",
+               slot, slot * 4, site ? site : ret, mod, mod_off, this_ptr,
+               forward ? "forwarded to the MWCrashFix method" :
+               fl ? (known ? "returned 0 / 0.0, arguments removed" : "returned 0 / 0.0") :
+                    (known ? "returned 0, arguments removed" : "returned 0"),
+               st->total);
+        if (first) { log_object_origin(this_ptr); log_game_stack((DWORD)(frame + 2)); }
+    }
+    if (forward) return -1;
+    return (int)(arg_bytes | (fl ? 0x10000u : 0u));
+}
+
+__asm__ (
+    ".text\n"
+    ".p2align 4\n"
+    "_dead_common:\n\t"
+    "pushl %ecx\n\t"
+    "pushl %ecx\n\t"
+    "leal  8(%esp), %eax\n\t"
+    "pushl %eax\n\t"
+    "call  _on_dead_call\n\t"
+    "addl  $8, %esp\n\t"
+    "popl  %ecx\n\t"
+    "cmpl  $-1, %eax\n\t"
+    "je    2f\n\t"
+    "testl $0x10000, %eax\n\t"
+    "jz    1f\n\t"
+    "fldz\n"
+    "1:\n\t"
+    "andl  $0xFFFF, %eax\n\t"
+    "popl  %edx\n\t"              /* slot           */
+    "popl  %ecx\n\t"              /* return address */
+    "addl  %eax, %esp\n\t"
+    "pushl %ecx\n\t"
+    "xorl  %eax, %eax\n\t"
+    "xorl  %edx, %edx\n\t"
+    "ret\n"
+    "2:\n\t"
+    "popl  %eax\n\t"
+    "jmp   *0x008AA828(,%eax,4)\n"
+    ".p2align 4\n"
+    ".globl _dead_stubs\n"
+    "_dead_stubs:\n"
+    ".set cg_slot, 0\n"
+    ".rept 128\n\t"
+    ".byte 0x68\n\t.long cg_slot\n\t"          /* push imm32 slot */
+    ".byte 0xE9\n\t.long _dead_common - (. + 4)\n"
+    ".set cg_slot, cg_slot + 1\n"
+    ".endr\n");
+
+extern const BYTE dead_stubs[];
+_Static_assert(DEAD_SLOTS == 128, "stub count in the asm block");
+
+static void init_dead_vtable(void)
+{
+    DWORD k;
+    g_dead_vtable[0] = BASE_DTOR;     /* the real destructor, as in the unpatched game */
+    for (k = 1; k < DEAD_SLOTS; k++) g_dead_vtable[k] = (DWORD)dead_stubs + 10 * k;
 }
 
 /* ------------------------------------------------------------------------------------------ */
@@ -582,8 +877,10 @@ __attribute__((used)) int __cdecl on_pure_call(DWORD frame, DWORD this_ptr)
                !site ? "caller unknown, the game shows R6025 and exits" :
                        "repeating too often, the game shows R6025 and exits",
                note, st->total);
-    if (st->total <= 3 || !recover)
+    if (st->total <= 3 || !recover) {
+        log_object_origin(this_ptr);
         log_game_stack(frame + 8);
+    }
     if (!recover) return -1;
     g_pure_recovered++;
     return (int)arg_bytes;
@@ -992,27 +1289,35 @@ static DWORD WINAPI self_test_thread(void *arg)
            GADGET_CALL, (DWORD)args);
 
     r = call_gadget(GADGET_LOAD, 0xDEADBEEF, UNMAPPED);
-    cg_log("self-test 1/4 load from bad pointer:   %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
+    cg_log("self-test 1/5 load from bad pointer:   %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
     passed += r == 0;
 
     r = call_gadget_args(GADGET_CALL, UNMAPPED, 0, args);
-    passed += st_check("self-test 2/4 call via bad pointer:   ", r);
+    passed += st_check("self-test 2/5 call via bad pointer:   ", r);
 
     g_fake_vtable[disp / 4] = UNMAPPED;
     r = call_gadget_args(GADGET_CALL, (DWORD)g_fake_vtable, 0xDEADBEEF, args);
-    passed += st_check("self-test 3/4 call into bad code:     ", r);
+    passed += st_check("self-test 3/5 call into bad code:     ", r);
 
     if (g_cfg.recover_pure_calls && *(DWORD *)CRT_PURECALL_SLOT == (DWORD)purecall_stub) {
         /* the game's "call [eax+disp]" reaches _purecall, exactly like a real R6025 */
         g_fake_vtable[disp / 4] = CRT_PURECALL;
         r = call_gadget_args(GADGET_CALL, (DWORD)g_fake_vtable, (DWORD)g_fake_vtable, args);
-        passed += st_check("self-test 4/4 pure virtual call:      ", r);
+        passed += st_check("self-test 4/5 pure virtual call:      ", r);
     } else {
-        cg_log("self-test 4/4 pure virtual call:       skipped (RecoverPureCalls=0)");
+        cg_log("self-test 4/5 pure virtual call:       skipped (RecoverPureCalls=0)");
         passed++;
     }
-    cg_log("self-test finished: %lu/4 passed%s", passed,
-           passed == 4 ? "" : " - please report this with chaseguard.log");
+    if (g_cfg.enable_patch && g_cfg.patch_mode == 2 && g_patch_value == (DWORD)g_dead_vtable && disp >= 4) {
+        /* the game's "call [eax+disp]" on an object whose vptr is ChaseGuard's table */
+        r = call_gadget_args(GADGET_CALL, (DWORD)g_dead_vtable, (DWORD)g_fake_vtable, args);
+        passed += st_check("self-test 5/5 call on destroyed interface:", r);
+    } else {
+        cg_log("self-test 5/5 call on destroyed interface: skipped (PatchMode is not 2)");
+        passed++;
+    }
+    cg_log("self-test finished: %lu/5 passed%s", passed,
+           passed == 5 ? "" : " - please report this with chaseguard.log");
     return 0;
 }
 
@@ -1035,11 +1340,12 @@ static void startup(HMODULE self)
     log_open();
     cg_log("=== ChaseGuard " CG_VERSION_STR " started ===");
     cg_log("config: %s", g_ini_path);
-    cg_log("EnablePatch=%d EnableHandler=%d RecoverFaults=%d RecoverBadCalls=%d RecoverPureCalls=%d "
-           "CorrectStack=%d ZeroLoadedRegister=%d LoopLimit=%d MaxLogKB=%d SelfTest=%d",
-         g_cfg.enable_patch, g_cfg.enable_handler, g_cfg.recover_faults, g_cfg.recover_bad_calls,
-         g_cfg.recover_pure_calls, g_cfg.correct_stack, g_cfg.zero_loaded_reg, g_cfg.loop_limit,
-         g_cfg.max_log_kb, g_cfg.self_test);
+    cg_log("EnablePatch=%d PatchMode=%d FixInterfaceRegistry=%d EnableHandler=%d RecoverFaults=%d "
+           "RecoverBadCalls=%d RecoverPureCalls=%d CorrectStack=%d ZeroLoadedRegister=%d LoopLimit=%d "
+           "MaxLogKB=%d SelfTest=%d",
+         g_cfg.enable_patch, g_cfg.patch_mode, g_cfg.fix_registry, g_cfg.enable_handler, g_cfg.recover_faults,
+         g_cfg.recover_bad_calls, g_cfg.recover_pure_calls, g_cfg.correct_stack, g_cfg.zero_loaded_reg,
+         g_cfg.loop_limit, g_cfg.max_log_kb, g_cfg.self_test);
 
     if (GetModuleHandleA("MWCrashFix.asi") || GetModuleHandleA("MWCrashFix.dll")) {
         cg_log("MWCrashFix is loaded as well - remove MWCrashFix.asi, only one of them must be installed");
@@ -1056,13 +1362,17 @@ static void startup(HMODULE self)
     cg_log("speed.exe: TimeDateStamp=%08lX SizeOfImage=%08lX .text=%08lX-%08lX",
          g_exe_stamp, g_exe_size, g_text_begin, g_text_end);
 
+    init_dead_vtable();
     ps = apply_patch();
     switch (ps) {
     case PATCH_APPLIED:
-        cg_log("patched %u references (%08X -> %08X)", (unsigned)SITE_COUNT, VALUE_OLD, VALUE_NEW);
+        cg_log("patched %u references (%08X -> %08lX, %s)", (unsigned)SITE_COUNT, VALUE_OLD, g_patch_value,
+               g_cfg.patch_mode == 0 ? "MWCrashFix table, PatchMode=0" :
+               g_cfg.patch_mode == 1 ? "ChaseGuard table, stale calls forwarded to the MWCrashFix methods, PatchMode=1" :
+                                       "ChaseGuard table, stale calls return 0, PatchMode=2");
         break;
     case PATCH_ALREADY:
-        cg_log("all %u references are already patched by another plugin - patch skipped", (unsigned)SITE_COUNT);
+        cg_log("all %u references already hold %08lX - nothing to change", (unsigned)SITE_COUNT, g_patch_value);
         break;
     case PATCH_DISABLED:
         cg_log("patch disabled in the ini (EnablePatch=0)");
@@ -1085,6 +1395,8 @@ static void startup(HMODULE self)
         message("Could not write to game memory. All changes were rolled back.", MB_ICONERROR);
         return;
     }
+
+    install_registry_fix();
 
     if (!cg_init()) {
         cg_log("instruction decoder failed to initialise - exception handler not installed");
@@ -1124,8 +1436,11 @@ BOOL WINAPI DllMain(HMODULE self, DWORD reason, void *reserved)
         if (g_veh && !reserved) { RemoveVectoredExceptionHandler(g_veh); g_veh = 0; }
         if (!g_exit_logged)
             cg_log("game is closing (exit path not seen by ChaseGuard)");
-        cg_log("=== session end: %lu recovered, %lu not recovered, %lu pure calls (%lu returned), %lu loop stops ===",
-             g_recovered, g_given_up, g_pure_calls, g_pure_recovered, g_loops);
+        cg_log("=== session end: %lu recovered, %lu not recovered, %lu pure calls (%lu returned), "
+               "%lu calls on destroyed interfaces (%lu forwarded), registry: %lu missing, %lu duplicate, "
+               "%lu re-registered, %lu loop stops ===",
+             g_recovered, g_given_up, g_pure_calls, g_pure_recovered, g_dead_calls, g_dead_forwarded,
+             g_reg_missing, g_reg_dupes, g_reg_double, g_loops);
         log_close();
     }
     return TRUE;

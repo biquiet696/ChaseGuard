@@ -1,6 +1,47 @@
 ChaseGuard changelog
 ====================
 
+2.2.0 - 2026-11-26
+
+  The cause of R6025, and a fix that does not run foreign code
+
+  * What R6025 really is. 0x890970 is the vtable of the game's interface base
+    class (EA's COM-style interfaces): its constructor registers the interface
+    with its owner object as a {type, pointer} pair, every destructor stores
+    0x890970 back and unregisters it. The table has one slot (the destructor);
+    slots 1-8 are floats and slot 9 onwards is _purecall. So R6025 is a
+    virtual call on an interface that was already destroyed: some game code
+    keeps a pointer after the owner deleted the object. It is not a window
+    during construction, as earlier notes said.
+  * PatchMode (new, default 2). MWCrashFix stores 0x8AA828, the table of an
+    unrelated class, so a stale call runs a real method of that class on freed
+    memory; slot 9 is a full function and others write into the object
+    (byte flags at +0xB1/+0xC8), which can corrupt whatever reuses that
+    memory. With PatchMode=2 the 434 sites store ChaseGuard's own table:
+    slot 0 is the game's real destructor (as unpatched), every other slot logs
+    the call and returns 0 without touching the object. The callee's arguments
+    are removed (the same analysis as CorrectStack) and, if the caller uses a
+    float result, 0.0 is pushed so the FPU stack stays balanced (5 % of the
+    game's virtual calls return a float). When the argument size cannot be
+    worked out, that one call goes to the MWCrashFix method instead.
+    PatchMode=1 logs and always forwards, PatchMode=0 is plain MWCrashFix.
+  * Interface registry fix (FixInterfaceRegistry=1). The game's unregister
+    function 0x5D5A50 is v.erase(std::remove(v.begin(), v.end(), x)), the
+    one-argument erase: an interface listed twice leaves one dangling pair in
+    its owner (which hands out the dead pointer later); one that is not listed
+    makes the copy loop run past the end of the vector and overwrite the heap.
+    It is replaced with a correct version; both cases and re-registration of a
+    listed interface are logged.
+  * Root-cause log. Every unregistered interface is remembered (last 1024).
+    A call on a destroyed interface, or an R6025, now logs what the object
+    was: interface type, owner, the destructor that removed it, how long ago,
+    and whether the owner still lists it (dangling registry entry) or the
+    caller kept its own copy of the pointer. Send chaseguard.log after a long
+    pursuit: these lines name the code that keeps the stale pointer.
+  * SelfTest has a fifth test: a game call through ChaseGuard's table,
+    checked for the return value and an exactly balanced stack.
+  * Tests: float-result detection, registry removal (80 checks).
+
 2.1.0 - 2026-11-26
 
   Added
