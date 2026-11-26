@@ -42,10 +42,16 @@ the fault comes from game code, and only in these cases:
 | A game `call` jumped into non-executable memory (corrupted function pointer) | returns to the caller with `EAX = 0`, but only if the bytes before the return address decode to a `CALL` whose operand really points to the faulting address |
 | `push`/`pop`/`ret`/`jmp`/anything that changes `ESP` faults | **not** touched (skipping would corrupt the stack); the game crashes as without the plugin |
 | A fault anywhere else (drivers, other mods, Windows) | **not** touched and not logged |
+| A game `call` reaches a pure virtual function (`R6025`) | returns `0` to the caller instead of closing the game (`RecoverPureCalls`) |
 | The same place faults more than `LoopLimit` times per second | stops recovering there, so the game crashes instead of freezing |
 
 When ChaseGuard does not recover, it passes the exception on. Windows and other crash handlers see the original
 crash, and `chaseguard.log` gets a register dump.
+
+**3. Exit diagnostics.** Every way the game ends is logged with the game call stack: a normal quit (exit code 0),
+any C runtime error box (`R6025`, `R6018`, ...; `speed.exe` uses the debug CRT, so these appear as "Microsoft
+Visual C++ Debug Library - Debug Error!"), and unhandled crashes with the module they happened in (game, driver,
+another mod).
 
 ## Settings (`ChaseGuard.ini`)
 
@@ -55,10 +61,11 @@ crash, and `chaseguard.log` gets a register dump.
 | `EnableHandler` | 1 | install the exception handler |
 | `RecoverFaults` | 1 | skip game instructions that access a broken pointer |
 | `RecoverBadCalls` | 1 | recover from calls through / into broken pointers |
+| `RecoverPureCalls` | 1 | `R6025 pure virtual function call` from game code returns `0` instead of closing the game |
 | `ZeroLoadedRegister` | 1 | clear the register a skipped load would have written |
 | `LoopLimit` | 500 | recoveries per second at one address before giving up there |
 | `MaxLogKB` | 1024 | log size limit |
-| `SelfTest` | 0 | `1` = 10 s after start, provoke three harmless faults in game code and log PASS/FAIL |
+| `SelfTest` | 0 | `1` = 10 s after start, provoke four harmless faults in game code and log PASS/FAIL |
 
 ## Reading the log
 
@@ -67,8 +74,15 @@ recovered #1 at 00402510: load from bad pointer skipped, register = 0 (skip-inst
 Faulting address 0061234A in game code, not recovered: control-flow/stack instruction cannot be skipped (read 00000004)
 ```
 
-`recovered` lines mean a crash was prevented. `not recovered` lines are followed by registers, stack and code
-bytes. Please attach `chaseguard.log` to bug reports.
+```
+pure virtual function call (R6025) from 0058A123 (speed.exe+18A123), this=0A3B1C40 vtable=00890970: returned 0 to the caller [1 at this address]
+game exits with code 3 after R6025 pure virtual function call
+UNHANDLED EXCEPTION C0000005 at 6A2B1F00 (amdxx32.dll+1F00), read 00000010 - the game crashes here
+```
+
+`recovered` / `returned 0` lines mean a crash was prevented. `not recovered`, `game exits with code ...` and
+`UNHANDLED EXCEPTION` lines are followed by registers and the game call stack. Please attach `chaseguard.log` to bug
+reports.
 
 ## Known limitations
 

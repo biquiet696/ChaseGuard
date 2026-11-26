@@ -1,6 +1,19 @@
 ChaseGuard changelog
 ====================
 
+2.0.1 - 2026-11-26
+
+  Added
+  * R6025 handling: ChaseGuard installs itself as the pure-call handler of the
+    game's C runtime (the _set_purecall_handler slot). A pure virtual call made
+    by game code returns 0 to its caller instead of closing the game
+    (RecoverPureCalls=1); every one is logged with its call site and vtable.
+  * Exit diagnostics: every exit is logged with its exit code and the game call
+    stack (normal quit, C runtime error boxes R60xx, unhandled crashes with the
+    module they happened in). Before, a crash and a normal quit looked the same
+    in the log.
+  * SelfTest covers the pure-call path (4 tests).
+
 2.0.0 - 2026-11-25  (rewrite from source)
 
   The plugin is now built from C source with LLVM instead of binary-patching the

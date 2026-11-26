@@ -75,4 +75,10 @@ cg_verdict cg_decide(const cg_env *env, cg_u32 access, cg_u32 fault_addr,
 
 const char *cg_kind_name(cg_kind kind);
 
+/*
+ * If the bytes right before ret (a return address in .text) decode to a CALL instruction,
+ * stores its address in *call_site and returns 1. Used for logging call stacks.
+ */
+int cg_call_before(const cg_env *env, cg_u32 ret, cg_u32 *call_site);
+
 #endif

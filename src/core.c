@@ -264,6 +264,25 @@ static cg_verdict decide_bad_call(const cg_env *env, cg_u32 access, cg_u32 fault
     return finish(out, CG_RECOVERED, "call into non-executable memory returned, EAX=0");
 }
 
+int cg_call_before(const cg_env *env, cg_u32 ret, cg_u32 *call_site)
+{
+    ZydisDecodedInstruction insn;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    cg_u32 n;
+    if (!g_ready || !in_text(env, ret))
+        return 0;
+    for (n = 2; n <= 7; n++) {
+        if (ret - n < env->text_begin)
+            break;
+        if (decode(env, ret - n, n, &insn, ops) && insn.length == n
+            && insn.mnemonic == ZYDIS_MNEMONIC_CALL) {
+            *call_site = ret - n;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 cg_verdict cg_decide(const cg_env *env, cg_u32 access, cg_u32 fault_addr,
                      cg_regs *regs, cg_result *out)
 {

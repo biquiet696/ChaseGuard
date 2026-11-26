@@ -74,6 +74,7 @@ typedef struct config {
     int loop_limit;     /* recoveries of one address per second before giving up on it */
     int max_log_kb;
     int self_test;      /* exercise the handler once, 10 seconds after start */
+    int recover_pure_calls; /* "R6025 pure virtual function call": return 0 instead of exiting */
 } config;
 
 static config g_cfg;
@@ -96,6 +97,7 @@ static void load_config(void)
     g_cfg.loop_limit        = ini_int("LoopLimit", 500, 10, 1000000);
     g_cfg.max_log_kb        = ini_int("MaxLogKB", 1024, 16, 65536);
     g_cfg.self_test         = ini_int("SelfTest", 0, 0, 1);
+    g_cfg.recover_pure_calls = ini_int("RecoverPureCalls", 1, 0, 1);
 }
 
 /* Directory of a module path including the trailing backslash. */
@@ -450,6 +452,258 @@ out:
 }
 
 /* ------------------------------------------------------------------------------------------ */
+/* Exit diagnostics: every way the game can end is logged with its origin.                     */
+/*  - R6025: the static CRT of speed.exe calls the handler stored at 0x9BA9F8 (the slot of     */
+/*    _set_purecall_handler) before it shows the error; ChaseGuard installs itself there.       */
+/*  - R60xx: _amsg_exit (0x7C4240) is hooked to log the runtime error number.                  */
+/*  - ExitProcess: the import slot of speed.exe is hooked to log the exit code and the caller.  */
+/*  - Unhandled exceptions: a top-level filter logs the module and registers, then chains to   */
+/*    the filter the game installs.                                                            */
+/* ------------------------------------------------------------------------------------------ */
+
+#define CRT_PURECALL        0x007C5200u   /* _purecall                                       */
+#define CRT_PURECALL_SLOT   0x009BA9F8u   /* handler pointer used by _purecall               */
+#define CRT_AMSG_EXIT       0x007C4240u   /* _amsg_exit(int rterrnum)                        */
+#define CRT_AMSG_EXIT_CONT  0x007C424Au   /* first instruction after the 10 replaced bytes   */
+#define IAT_EXIT_PROCESS    0x008901C4u   /* speed.exe import slot of kernel32!ExitProcess   */
+#define IAT_SET_UEF         0x0089022Cu   /* ... of kernel32!SetUnhandledExceptionFilter     */
+
+static DWORD g_real_exit_process;
+static PTOP_LEVEL_EXCEPTION_FILTER g_game_filter;
+static DWORD g_last_rt_error, g_pure_calls, g_pure_recovered;
+static volatile LONG g_exit_logged;
+
+static void module_of(DWORD addr, char *out, DWORD cap, DWORD *offset)
+{
+    HMODULE m = 0;
+    char path[300];
+    DWORD n, i, cut = 0;
+    out[0] = 0;
+    *offset = addr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)addr, &m) || !m) {
+        str_copy(out, cap, "?");
+        return;
+    }
+    n = GetModuleFileNameA(m, path, sizeof(path));
+    if (n == 0 || n >= sizeof(path)) { str_copy(out, cap, "?"); return; }
+    for (i = 0; i < n; i++) if (path[i] == '\\' || path[i] == '/') cut = i + 1;
+    str_copy(out, cap, path + cut);
+    *offset = addr - (DWORD)m;
+}
+
+/* Logs up to 8 return addresses into game code found on the stack (each preceded by a CALL). */
+static void log_game_stack(DWORD esp)
+{
+    DWORD i, v, found = 0;
+    cg_u32 site;
+    char line[200], item[24];
+    line[0] = 0;
+    for (i = 0; i < 512 && found < 8; i++) {
+        if (!safe_read(0, esp + i * 4, &v, 4)) break;
+        if (cg_call_before(&g_env, v, &site)) {
+            fmt(item, sizeof(item), found ? " <- %08lX" : "%08lX", site);
+            str_cat(line, sizeof(line), item);
+            found++;
+        }
+    }
+    cg_log("  game call stack (newest first): %s", found ? line : "none found");
+}
+
+static const char *rt_error_text(DWORD n)
+{
+    switch (n) {
+    case 2:  return "R6002 floating point support not loaded";
+    case 8:  return "R6008 not enough space for arguments";
+    case 9:  return "R6009 not enough space for environment";
+    case 16: return "R6016 not enough space for thread data";
+    case 17: return "R6017 unexpected multithread lock error";
+    case 18: return "R6018 unexpected heap error";
+    case 19: return "R6019 unable to open console device";
+    case 24: return "R6024 not enough space for _onexit/atexit table";
+    case 25: return "R6025 pure virtual function call";
+    case 26: return "R6026 not enough space for stdio initialization";
+    case 27: return "R6027 not enough space for lowio initialization";
+    case 28: return "R6028 unable to initialize heap";
+    default: return "runtime error";
+    }
+}
+
+/* Called from purecall_stub. frame = EBP of _purecall, this_ptr = ECX of the virtual call.
+   Returns 1 to make the pure virtual call return 0 to its caller, 0 to let R6025 happen. */
+__attribute__((used)) int __cdecl on_pure_call(DWORD frame, DWORD this_ptr)
+{
+    DWORD ret = 0, vptr = 0, mod_off;
+    cg_u32 site = 0;
+    char mod[64];
+    int recover;
+    addr_stat *st;
+
+    safe_read(0, frame + 4, &ret, 4);
+    safe_read(0, this_ptr, &vptr, 4);
+    cg_call_before(&g_env, ret, &site);
+    module_of(site ? site : ret, mod, sizeof(mod), &mod_off);
+    g_pure_calls++;
+
+    lock();
+    st = stat_for(site ? site : ret);
+    st->total++;
+    recover = g_cfg.recover_pure_calls && site && !st->given_up;
+    if (recover) {
+        DWORD now = GetTickCount();
+        if (now - st->window_start >= 1000) { st->window_start = now; st->window_count = 0; }
+        if (++st->window_count > (DWORD)g_cfg.loop_limit) {
+            st->given_up = 1;
+            recover = 0;
+            g_loops++;
+        }
+    }
+    unlock();
+
+    if (st->total <= 10 || worth_logging(st->total) || !recover)
+        cg_log("pure virtual function call (R6025) from %08lX (%s+%lX), this=%08lX vtable=%08lX: %s [%lu at this address]",
+               site ? site : ret, mod, mod_off, this_ptr, vptr,
+               recover ? "returned 0 to the caller" :
+               !g_cfg.recover_pure_calls ? "RecoverPureCalls=0, the game shows R6025 and exits" :
+               !site ? "caller unknown, the game shows R6025 and exits" :
+                       "repeating too often, the game shows R6025 and exits",
+               st->total);
+    if (st->total <= 3 || !recover)
+        log_game_stack(frame + 8);
+    if (recover) g_pure_recovered++;
+    return recover;
+}
+
+/* Installed in the CRT purecall slot. On entry: [esp] = return into _purecall, EBP = frame of
+   _purecall ([ebp+4] = caller of the pure virtual function), ECX = this. */
+__declspec(naked) static void purecall_stub(void)
+{
+    __asm__ volatile (
+        "pushl %ecx\n\t"
+        "pushl %ebp\n\t"
+        "call  _on_pure_call\n\t"
+        "addl  $8, %esp\n\t"
+        "testl %eax, %eax\n\t"
+        "jz    1f\n\t"
+        "movl  %ebp, %esp\n\t"     /* leave _purecall's frame ...                       */
+        "popl  %ebp\n\t"
+        "xorl  %eax, %eax\n\t"     /* ... and return 0 to the code that made the call   */
+        "ret\n"
+        "1:\n\t"
+        "ret\n\t");
+}
+
+__attribute__((used)) void __cdecl on_rt_error(DWORD code, DWORD esp_at_entry)
+{
+    g_last_rt_error = code;
+    cg_log("C runtime error %lu: %s - the game will show an error box and exit", code, rt_error_text(code));
+    log_game_stack(esp_at_entry);
+}
+
+/* Replaces the first 10 bytes of _amsg_exit (push ebp; mov ebp,esp; cmp dword [0x9BA9EC],2). */
+__declspec(naked) static void amsg_exit_stub(void)
+{
+    __asm__ volatile (
+        "movl  %esp, %eax\n\t"
+        "pushl %eax\n\t"                /* esp at entry: [eax] = return address, [eax+4] = code */
+        "pushl 4(%eax)\n\t"
+        "call  _on_rt_error\n\t"
+        "addl  $8, %esp\n\t"
+        "pushl %ebp\n\t"                /* the replaced instructions                          */
+        "movl  %esp, %ebp\n\t"
+        "pushl $0x007C424A\n\t"
+        "cmpl  $2, 0x009BA9EC\n\t"
+        "ret\n\t");                     /* continue in _amsg_exit with the flags of the cmp   */
+}
+
+static void WINAPI hook_exit_process(DWORD code)
+{
+    if (!__sync_lock_test_and_set(&g_exit_logged, 1)) {
+        if (code == 0)
+            cg_log("game exits normally (exit code 0)");
+        else
+            cg_log("game exits with code %lu%s%s", code,
+                   g_last_rt_error ? " after " : "", g_last_rt_error ? rt_error_text(g_last_rt_error) : "");
+        log_game_stack((DWORD)&code);
+    }
+    ((void (WINAPI *)(DWORD))g_real_exit_process)(code);
+}
+
+static LONG WINAPI top_filter(EXCEPTION_POINTERS *ep)
+{
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    DWORD off;
+    char mod[64];
+    module_of((DWORD)er->ExceptionAddress, mod, sizeof(mod), &off);
+    cg_log("UNHANDLED EXCEPTION %08lX at %08lX (%s+%lX)%s%s %08lX - the game crashes here",
+           er->ExceptionCode, (DWORD)er->ExceptionAddress, mod, off,
+           er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2 ? ", " : "",
+           er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2
+               ? access_name(er->ExceptionInformation[0]) : "",
+           er->NumberParameters >= 2 ? er->ExceptionInformation[1] : 0);
+    dump_context(ep->ContextRecord);
+    log_game_stack(ep->ContextRecord->Esp);
+    g_exit_logged = 1;
+    return g_game_filter ? g_game_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* The game's own SetUnhandledExceptionFilter calls: keep ChaseGuard's filter first in line. */
+static PTOP_LEVEL_EXCEPTION_FILTER WINAPI hook_set_uef(PTOP_LEVEL_EXCEPTION_FILTER f)
+{
+    PTOP_LEVEL_EXCEPTION_FILTER prev = g_game_filter;
+    g_game_filter = (f == top_filter) ? 0 : f;
+    return prev;
+}
+
+static int write_code(DWORD addr, const void *src, DWORD n)
+{
+    DWORD old, tmp, i;
+    if (!VirtualProtect((void *)addr, n, PAGE_EXECUTE_READWRITE, &old)) return 0;
+    for (i = 0; i < n; i++) ((volatile BYTE *)addr)[i] = ((const BYTE *)src)[i];
+    VirtualProtect((void *)addr, n, old, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), (void *)addr, n);
+    return 1;
+}
+
+static int bytes_equal(DWORD addr, const BYTE *b, DWORD n)
+{
+    DWORD i;
+    for (i = 0; i < n; i++) if (((const BYTE *)addr)[i] != b[i]) return 0;
+    return 1;
+}
+
+static void install_diagnostics(void)
+{
+    static const BYTE purecall[] = { 0x55, 0x8B, 0xEC, 0x83, 0x3D, 0xF8, 0xA9, 0x9B, 0x00, 0x00 };
+    static const BYTE amsg[]     = { 0x55, 0x8B, 0xEC, 0x83, 0x3D, 0xEC, 0xA9, 0x9B, 0x00, 0x02 };
+    BYTE jmp[10];
+    DWORD v, i;
+    int ok_pure = 0, ok_rt = 0, ok_exit = 0, ok_uef = 0;
+
+    if (bytes_equal(CRT_PURECALL, purecall, sizeof(purecall)) && *(DWORD *)CRT_PURECALL_SLOT == 0) {
+        v = (DWORD)purecall_stub;
+        ok_pure = write_code(CRT_PURECALL_SLOT, &v, 4);   /* plain data slot, as _set_purecall_handler */
+    }
+    if (bytes_equal(CRT_AMSG_EXIT, amsg, sizeof(amsg))) {
+        jmp[0] = 0xE9;
+        *(DWORD *)(jmp + 1) = (DWORD)amsg_exit_stub - (CRT_AMSG_EXIT + 5);
+        for (i = 5; i < 10; i++) jmp[i] = 0xCC;
+        ok_rt = write_code(CRT_AMSG_EXIT, jmp, sizeof(jmp));
+    }
+    if (safe_read(0, IAT_EXIT_PROCESS, &v, 4) && v && (v < g_text_begin || v >= g_text_end)) {
+        g_real_exit_process = v;
+        v = (DWORD)hook_exit_process;
+        ok_exit = write_code(IAT_EXIT_PROCESS, &v, 4);
+    }
+    g_game_filter = SetUnhandledExceptionFilter(top_filter);
+    if (g_game_filter == top_filter) g_game_filter = 0;
+    v = (DWORD)hook_set_uef;
+    ok_uef = write_code(IAT_SET_UEF, &v, 4);
+    cg_log("diagnostics: pure-call handler %s, runtime-error hook %s, exit hook %s, crash filter %s",
+           ok_pure ? "on" : "OFF", ok_rt ? "on" : "OFF", ok_exit ? "on" : "OFF", ok_uef ? "on" : "OFF");
+}
+
+/* ------------------------------------------------------------------------------------------ */
 /* Self-test (SelfTest=1): runs three tiny pieces of speed.exe code with broken pointers, one   */
 /* for each recovery path, and logs whether the handler brought them back.                     */
 /* ------------------------------------------------------------------------------------------ */
@@ -491,23 +745,33 @@ static DWORD WINAPI self_test_thread(void *arg)
         return 0;
     }
     disp = ((const BYTE *)GADGET_CALL)[2];
-    cg_log("self-test: starting (3 deliberate access violations in game code follow)");
+    cg_log("self-test: starting (deliberate faults in game code follow)");
 
     r = call_gadget(GADGET_LOAD, 0xDEADBEEF, UNMAPPED);
-    cg_log("self-test 1/3 load from bad pointer:   %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
+    cg_log("self-test 1/4 load from bad pointer:   %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
     passed += r == 0;
 
     r = call_gadget(GADGET_CALL, UNMAPPED, 0);
-    cg_log("self-test 2/3 call via bad pointer:    %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
+    cg_log("self-test 2/4 call via bad pointer:    %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
     passed += r == 0;
 
     g_fake_vtable[disp / 4] = UNMAPPED;
     r = call_gadget(GADGET_CALL, (DWORD)g_fake_vtable, 0xDEADBEEF);
-    cg_log("self-test 3/3 call into bad code:      %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
+    cg_log("self-test 3/4 call into bad code:      %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
     passed += r == 0;
 
-    cg_log("self-test finished: %lu/3 passed%s", passed,
-           passed == 3 ? "" : " - please report this with chaseguard.log");
+    if (g_cfg.recover_pure_calls && *(DWORD *)CRT_PURECALL_SLOT == (DWORD)purecall_stub) {
+        /* the game's "call [eax+disp]" reaches _purecall, exactly like a real R6025 */
+        g_fake_vtable[disp / 4] = CRT_PURECALL;
+        r = call_gadget(GADGET_CALL, (DWORD)g_fake_vtable, (DWORD)g_fake_vtable);
+        cg_log("self-test 4/4 pure virtual call:       %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
+        passed += r == 0;
+    } else {
+        cg_log("self-test 4/4 pure virtual call:       skipped (RecoverPureCalls=0)");
+        passed++;
+    }
+    cg_log("self-test finished: %lu/4 passed%s", passed,
+           passed == 4 ? "" : " - please report this with chaseguard.log");
     return 0;
 }
 
@@ -530,10 +794,11 @@ static void startup(HMODULE self)
     log_open();
     cg_log("=== ChaseGuard " CG_VERSION_STR " started ===");
     cg_log("config: %s", g_ini_path);
-    cg_log("EnablePatch=%d EnableHandler=%d RecoverFaults=%d RecoverBadCalls=%d ZeroLoadedRegister=%d "
-           "LoopLimit=%d MaxLogKB=%d SelfTest=%d",
+    cg_log("EnablePatch=%d EnableHandler=%d RecoverFaults=%d RecoverBadCalls=%d RecoverPureCalls=%d "
+           "ZeroLoadedRegister=%d LoopLimit=%d MaxLogKB=%d SelfTest=%d",
          g_cfg.enable_patch, g_cfg.enable_handler, g_cfg.recover_faults, g_cfg.recover_bad_calls,
-         g_cfg.zero_loaded_reg, g_cfg.loop_limit, g_cfg.max_log_kb, g_cfg.self_test);
+         g_cfg.recover_pure_calls, g_cfg.zero_loaded_reg, g_cfg.loop_limit, g_cfg.max_log_kb,
+         g_cfg.self_test);
 
     if (GetModuleHandleA("MWCrashFix.asi") || GetModuleHandleA("MWCrashFix.dll")) {
         cg_log("MWCrashFix is loaded as well - remove MWCrashFix.asi, only one of them must be installed");
@@ -580,10 +845,6 @@ static void startup(HMODULE self)
         return;
     }
 
-    if (!g_cfg.enable_handler) {
-        cg_log("exception handler disabled in the ini (EnableHandler=0)");
-        return;
-    }
     if (!cg_init()) {
         cg_log("instruction decoder failed to initialise - exception handler not installed");
         return;
@@ -595,6 +856,12 @@ static void startup(HMODULE self)
     g_env.zero_loaded_reg = g_cfg.zero_loaded_reg;
     g_env.read = safe_read;
     g_env.read_user = 0;
+    install_diagnostics();
+
+    if (!g_cfg.enable_handler) {
+        cg_log("exception handler disabled in the ini (EnableHandler=0)");
+        return;
+    }
     g_veh = AddVectoredExceptionHandler(1, veh);
     if (!g_veh) {
         cg_log("AddVectoredExceptionHandler failed (error %lu)", GetLastError());
@@ -612,8 +879,10 @@ BOOL WINAPI DllMain(HMODULE self, DWORD reason, void *reserved)
         startup(self);
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_veh && !reserved) { RemoveVectoredExceptionHandler(g_veh); g_veh = 0; }
-        cg_log("=== session end: %lu recovered, %lu not recovered, %lu loop stops ===",
-             g_recovered, g_given_up, g_loops);
+        if (!g_exit_logged)
+            cg_log("game is closing (exit path not seen by ChaseGuard)");
+        cg_log("=== session end: %lu recovered, %lu not recovered, %lu pure calls (%lu returned), %lu loop stops ===",
+             g_recovered, g_given_up, g_pure_calls, g_pure_recovered, g_loops);
         log_close();
     }
     return TRUE;

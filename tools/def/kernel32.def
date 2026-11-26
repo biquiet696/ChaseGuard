@@ -21,3 +21,5 @@ GetLastError@0
 Sleep@4
 GetTickCount@0
 CreateThread@24
+SetUnhandledExceptionFilter@4
+GetModuleHandleExA@12
