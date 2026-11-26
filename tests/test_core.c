@@ -37,6 +37,7 @@ static int fake_read(void *u, cg_u32 addr, void *dst, cg_u32 len)
 static uint32_t rd32le(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
 static uint32_t g_text_begin, g_text_end;
+static const uint8_t *g_text_image;
 
 static void load_exe(const char *path)
 {
@@ -59,7 +60,7 @@ static void load_exe(const char *path)
         g_map[g_nmap].va = base + va;
         g_map[g_nmap].size = vs < rs ? vs : rs;
         g_map[g_nmap].data = d + ra;
-        if (!memcmp(d + sec, ".text", 6)) { g_text_begin = base + va; g_text_end = base + va + vs; }
+        if (!memcmp(d + sec, ".text", 6)) { g_text_begin = base + va; g_text_end = base + va + vs; g_text_image = d + ra; }
         g_nmap++;
     }
     g_map[g_nmap++] = (region){ STACK_VA, sizeof(g_stack), g_stack };
@@ -70,7 +71,11 @@ static void load_exe(const char *path)
 static int g_fail, g_pass;
 static cg_env env_default(void)
 {
-    cg_env e = { g_text_begin, g_text_end, 1, 1, 1, fake_read, 0 };
+    cg_env e;
+    memset(&e, 0, sizeof(e));
+    e.text_begin = g_text_begin; e.text_end = g_text_end;
+    e.recover_faults = 1; e.recover_bad_calls = 1; e.zero_loaded_reg = 1; e.correct_stack = 1;
+    e.read = fake_read; e.read_user = 0; e.text_image = g_text_image;
     return e;
 }
 static cg_regs regs_with(uint32_t eip)
@@ -239,6 +244,103 @@ static void test_bad_calls(void)
     run("RecoverBadCalls=0", &e, CG_ACCESS_EXECUTE, BAD_CODE, &r, CG_GIVE_UP);
 }
 
+
+/* ---- argument size of calls (stack correction) ---- */
+typedef struct { uint32_t addr; char *text; } line_t;
+static line_t *g_lines; static size_t g_nlines;
+
+static void load_listing(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    char buf[512];
+    size_t cap = 0;
+    if (!f) return;
+    while (fgets(buf, sizeof(buf), f)) {
+        unsigned a; char *p = strchr(buf, ':');
+        if (!p || sscanf(buf, " %x:", &a) != 1) continue;
+        if (g_nlines == cap) { cap = cap ? cap * 2 : 1 << 20; g_lines = realloc(g_lines, cap * sizeof(line_t)); }
+        g_lines[g_nlines].addr = a;
+        g_lines[g_nlines].text = strdup(p + 1);
+        g_nlines++;
+    }
+    fclose(f);
+}
+static long line_index(uint32_t a)
+{
+    size_t lo = 0, hi = g_nlines;
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_lines[mid].addr < a) lo = mid + 1; else hi = mid; }
+    return lo < g_nlines && g_lines[lo].addr == a ? (long)lo : -1;
+}
+/* ground truth: the "ret N" of a function, if all its returns agree */
+static int truth_pop(uint32_t target, uint32_t *bytes)
+{
+    long i = line_index(target), n;
+    int found = 0; uint32_t v = 0;
+    if (i < 0) return 0;
+    for (n = 0; n < 4000 && i + n < (long)g_nlines; n++) {
+        const char *t = g_lines[i + n].text;
+        unsigned imm;
+        if (strstr(t, "int3")) break;
+        if (strstr(t, "\tret")) {
+            uint32_t cur = sscanf(strstr(t, "\tret") + 4, " 0x%x", &imm) == 1 ? imm : 0;
+            if (found && cur != v) return 0;
+            v = cur; found = 1;
+        }
+    }
+    *bytes = v;
+    return found;
+}
+
+static void test_arg_sizes(void)
+{
+    cg_env e = env_default();
+    uint32_t b; size_t i;
+    unsigned total = 0, exact = 0, unknown = 0;
+    puts("D) argument size of calls (stack correction)");
+    CHECK(cg_call_arg_bytes(&e, 0x402567, &b) && b == 12, "0x402567 call [eax+4] after 3 pushes: %u", b);
+    CHECK(cg_call_arg_bytes(&e, 0x5d5aff, &b) && b == 0, "0x5d5aff cdecl callback (add esp after): %u", b);
+    CHECK(cg_call_arg_bytes(&e, 0x40a9b5, &b) && b == 0, "0x40a9b5 virtual call without args: %u", b);
+    CHECK(cg_call_arg_bytes(&e, 0x42c9d8, &b) && b == 8, "0x42c9d8 call [abs] with 2 args: %u", b);
+    CHECK(!cg_call_arg_bytes(&e, 0x402510, &b), "0x402510 is not a call");
+    printf("  fixed cases checked\n");
+    if (!g_nlines) { puts("  (no listing, ground-truth run skipped)"); return; }
+    for (i = 0; i < g_nlines; i++) {
+        unsigned t; uint32_t truth;
+        const char *c = strstr(g_lines[i].text, "\tcall\t0x");
+        if (!c || sscanf(c + 6, "0x%x", &t) != 1) continue;
+        if (!truth_pop(t, &truth) || truth == 0) continue;
+        total++;
+        if (!cg_call_arg_bytes(&e, g_lines[i].addr, &b)) unknown++;
+        else if (b == truth) exact++;
+    }
+    printf("  callee-cleaned direct calls: %u, exact %u (%.2f%%), not analysable %u\n",
+           total, exact, 100.0 * exact / total, unknown);
+    CHECK(total > 20000 && exact * 100 >= total * 85, "argument size accuracy below 85%%");
+}
+
+static void test_stack_correction(void)
+{
+    cg_env e = env_default();
+    cg_regs r; cg_result res;
+    uint32_t vt = HEAP_VA + 0x200;
+    puts("E) recoveries remove the callee's arguments");
+    /* 0x402567: push edx x3; call [eax+4] -> 12 bytes of arguments */
+    r = regs_with(0x402567); r.eax = 0x10;
+    res = run("skip call [eax+4] with 3 args", &e, CG_ACCESS_READ, 0x14, &r, CG_RECOVERED);
+    CHECK(r.esp == STACK_VA + 0x800 + 12 && res.arg_known && res.arg_bytes == 12, "esp=%08x args=%u", r.esp, res.arg_bytes);
+
+    put32(g_heap, HEAP_VA, vt + 4, BAD_CODE);
+    r = regs_with(BAD_CODE); r.eax = vt; r.esp = STACK_VA + 0x7FC;
+    put32(g_stack, STACK_VA, r.esp, 0x40256a);
+    res = run("call [eax+4] into garbage with 3 args", &e, CG_ACCESS_EXECUTE, BAD_CODE, &r, CG_RECOVERED);
+    CHECK(r.eip == 0x40256a && r.esp == STACK_VA + 0x800 + 12, "eip=%08x esp=%08x", r.eip, r.esp);
+
+    e.correct_stack = 0;
+    r = regs_with(0x402567); r.eax = 0x10;
+    run("same with CorrectStack=0", &e, CG_ACCESS_READ, 0x14, &r, CG_RECOVERED);
+    CHECK(r.esp == STACK_VA + 0x800, "esp must stay: %08x", r.esp);
+}
+
 /* Cross-check: Zydis instruction lengths against llvm-objdump for the whole .text. */
 static int is_artifact(const char *text)
 {
@@ -291,7 +393,9 @@ int main(int argc, char **argv)
     if (!cg_init()) { puts("cg_init failed"); return 1; }
     test_in_game_code();
     test_bad_calls();
-    if (argc > 2) test_lengths(argv[2]);
+    if (argc > 2) { test_lengths(argv[2]); load_listing(argv[2]); }
+    test_arg_sizes();
+    test_stack_correction();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail != 0;
 }

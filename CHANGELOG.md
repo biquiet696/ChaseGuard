@@ -1,6 +1,26 @@
 ChaseGuard changelog
 ====================
 
+2.1.0 - 2026-11-26
+
+  Added
+  * Stack correction after recovered calls (CorrectStack=1). Game functions
+    mostly use __thiscall/__stdcall: the called function removes its own
+    arguments. When ChaseGuard skips such a call (call through a bad pointer,
+    call into bad code, R6025), it now removes those arguments as well, so the
+    caller continues with a correct ESP. Before (and in MWCrashFix) the stack
+    stayed off by the argument size, which in frame-pointer-less game code
+    usually ends in a crash a few instructions later.
+    The size is worked out from the caller's code: the function is decoded
+    from its start, and the argument pushes of the call are counted with the
+    prologue (saved registers, SEH frame, locals), structures passed by value
+    and nested calls taken into account; a call followed by "add esp, N" is
+    __cdecl and needs nothing. Exact for 88.7 % of the 22,627 direct
+    callee-cleaned calls in speed.exe (checked in tests/).
+  * The log shows how many argument bytes were removed for each recovery.
+  * SelfTest checks the stack balance exactly (entering game code with the
+    same stack its own function would have).
+
 2.0.2 - 2026-11-26
 
   Added

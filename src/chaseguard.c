@@ -75,6 +75,7 @@ typedef struct config {
     int max_log_kb;
     int self_test;      /* exercise the handler once, 10 seconds after start */
     int recover_pure_calls; /* "R6025 pure virtual function call": return 0 instead of exiting */
+    int correct_stack;  /* remove the arguments of a skipped callee from the stack */
 } config;
 
 static config g_cfg;
@@ -98,6 +99,7 @@ static void load_config(void)
     g_cfg.max_log_kb        = ini_int("MaxLogKB", 1024, 16, 65536);
     g_cfg.self_test         = ini_int("SelfTest", 0, 0, 1);
     g_cfg.recover_pure_calls = ini_int("RecoverPureCalls", 1, 0, 1);
+    g_cfg.correct_stack     = ini_int("CorrectStack", 1, 0, 1);
 }
 
 /* Directory of a module path including the trailing backslash. */
@@ -430,10 +432,16 @@ static LONG WINAPI veh(EXCEPTION_POINTERS *ep)
             goto out;
         }
         g_recovered++;
-        if (worth_logging(st->total))
-            cg_log("recovered #%lu at %08lX: %s (%s %s %08lX%s) [%lu at this address]",
+        if (worth_logging(st->total)) {
+            char stack_note[48];
+            stack_note[0] = 0;
+            if (res.kind == CG_KIND_SKIP_CALL || res.kind == CG_KIND_RETURN_BAD_CALL)
+                fmt(stack_note, sizeof(stack_note), res.arg_known ? ", %lu arg bytes removed" :
+                    ", arg size unknown", (DWORD)res.arg_bytes);
+            cg_log("recovered #%lu at %08lX: %s (%s %s %08lX%s%s) [%lu at this address]",
                  g_recovered, key, res.reason, cg_kind_name(res.kind), access_name(access), fault,
-                 res.zeroed ? ", register cleared" : "", st->total);
+                 res.zeroed ? ", register cleared" : "", stack_note, st->total);
+        }
         c->Eax = r.eax; c->Ecx = r.ecx; c->Edx = r.edx; c->Ebx = r.ebx;
         c->Esp = r.esp; c->Ebp = r.ebp; c->Esi = r.esi; c->Edi = r.edi; c->Eip = r.eip;
         ret = EXCEPTION_CONTINUE_EXECUTION;
@@ -530,13 +538,14 @@ static const char *rt_error_text(DWORD n)
 }
 
 /* Called from purecall_stub. frame = EBP of _purecall, this_ptr = ECX of the virtual call.
-   Returns 1 to make the pure virtual call return 0 to its caller, 0 to let R6025 happen. */
+   Returns the number of argument bytes to remove when the pure virtual call should return 0 to
+   its caller, or -1 to let R6025 happen. */
 __attribute__((used)) int __cdecl on_pure_call(DWORD frame, DWORD this_ptr)
 {
     DWORD ret = 0, vptr = 0, mod_off;
-    cg_u32 site = 0;
-    char mod[64];
-    int recover;
+    cg_u32 site = 0, arg_bytes = 0;
+    char mod[64], note[40];
+    int recover, arg_known = 0;
     addr_stat *st;
 
     safe_read(0, frame + 4, &ret, 4);
@@ -558,20 +567,26 @@ __attribute__((used)) int __cdecl on_pure_call(DWORD frame, DWORD this_ptr)
             g_loops++;
         }
     }
+    if (recover && g_cfg.correct_stack)
+        arg_known = cg_call_arg_bytes(&g_env, site, &arg_bytes);
     unlock();
 
+    note[0] = 0;
+    if (recover)
+        fmt(note, sizeof(note), arg_known ? ", %lu arg bytes removed" : ", arg size unknown", (DWORD)arg_bytes);
     if (st->total <= 10 || worth_logging(st->total) || !recover)
-        cg_log("pure virtual function call (R6025) from %08lX (%s+%lX), this=%08lX vtable=%08lX: %s [%lu at this address]",
+        cg_log("pure virtual function call (R6025) from %08lX (%s+%lX), this=%08lX vtable=%08lX: %s%s [%lu at this address]",
                site ? site : ret, mod, mod_off, this_ptr, vptr,
                recover ? "returned 0 to the caller" :
                !g_cfg.recover_pure_calls ? "RecoverPureCalls=0, the game shows R6025 and exits" :
                !site ? "caller unknown, the game shows R6025 and exits" :
                        "repeating too often, the game shows R6025 and exits",
-               st->total);
+               note, st->total);
     if (st->total <= 3 || !recover)
         log_game_stack(frame + 8);
-    if (recover) g_pure_recovered++;
-    return recover;
+    if (!recover) return -1;
+    g_pure_recovered++;
+    return (int)arg_bytes;
 }
 
 /* Installed in the CRT purecall slot. On entry: [esp] = return into _purecall, EBP = frame of
@@ -583,11 +598,14 @@ __declspec(naked) static void purecall_stub(void)
         "pushl %ebp\n\t"
         "call  _on_pure_call\n\t"
         "addl  $8, %esp\n\t"
-        "testl %eax, %eax\n\t"
-        "jz    1f\n\t"
-        "movl  %ebp, %esp\n\t"     /* leave _purecall's frame ...                       */
+        "cmpl  $-1, %eax\n\t"
+        "je    1f\n\t"
+        "movl  %ebp, %esp\n\t"     /* leave _purecall's frame ...                         */
         "popl  %ebp\n\t"
-        "xorl  %eax, %eax\n\t"     /* ... and return 0 to the code that made the call   */
+        "popl  %ecx\n\t"           /* return address of the virtual call                  */
+        "addl  %eax, %esp\n\t"     /* remove the arguments the callee would have removed  */
+        "pushl %ecx\n\t"
+        "xorl  %eax, %eax\n\t"     /* ... and return 0 to the code that made the call     */
         "ret\n"
         "1:\n\t"
         "ret\n\t");
@@ -885,8 +903,9 @@ static void install_quit_diagnostics(void)
 #define UNMAPPED    0x00000012u   /* inside the never-mapped first 64 KB */
 
 static DWORD g_fake_vtable[64];
+static volatile DWORD g_st_esp_after, g_st_esp_expected;
 
-/* cdecl: calls target with EAX/ECX preset, returns EAX. Must not be inlined or reordered. */
+/* cdecl: calls target with EAX/ECX preset, returns EAX (for code that ends in "ret"). */
 __declspec(naked) static DWORD call_gadget(DWORD target, DWORD eax_value, DWORD ecx_value)
 {
     __asm__ volatile (
@@ -894,6 +913,47 @@ __declspec(naked) static DWORD call_gadget(DWORD target, DWORD eax_value, DWORD 
         "movl 12(%esp), %ecx\n\t"
         "movl 4(%esp), %edx\n\t"
         "call *%edx\n\t"
+        "ret\n\t");
+}
+
+/*
+ * cdecl: enters game code at a CALL instruction the way its own function would: the stack holds
+ * a return address and then arg_bytes of (dummy) arguments. If ChaseGuard removes exactly the
+ * arguments of the failed call, the game's "ret" after the call comes back here with ESP where
+ * it was before the arguments were pushed; that ESP is recorded for the check.
+ */
+__declspec(naked) static DWORD call_gadget_args(DWORD target, DWORD eax_value, DWORD ecx_value, DWORD arg_bytes)
+{
+    __asm__ volatile (
+        "pushl %ebp\n\t"
+        "movl  %esp, %ebp\n\t"
+        "pushl %ebx\n\t"
+        "pushl %esi\n\t"
+        "pushl %edi\n\t"
+        "pushl $2f\n\t"                 /* where the game's "ret" must come back to */
+        "movl  %esp, %eax\n\t"
+        "addl  $4, %eax\n\t"
+        "movl  %eax, _g_st_esp_expected\n\t"
+        "movl  20(%ebp), %ecx\n\t"
+        "shrl  $2, %ecx\n"
+        "1:\n\t"
+        "testl %ecx, %ecx\n\t"
+        "jz    3f\n\t"
+        "pushl $0xA5A5A5A5\n\t"         /* dummy argument */
+        "decl  %ecx\n\t"
+        "jmp   1b\n"
+        "3:\n\t"
+        "movl  12(%ebp), %eax\n\t"
+        "movl  16(%ebp), %ecx\n\t"
+        "movl  8(%ebp), %edx\n\t"
+        "jmp   *%edx\n"
+        "2:\n\t"
+        "movl  %esp, _g_st_esp_after\n\t"
+        "leal  -12(%ebp), %esp\n\t"
+        "popl  %edi\n\t"
+        "popl  %esi\n\t"
+        "popl  %ebx\n\t"
+        "popl  %ebp\n\t"
         "ret\n\t");
 }
 
@@ -905,11 +965,21 @@ static int gadget_ok(DWORD addr, const BYTE *pattern, DWORD n, DWORD wildcard)
     return 1;
 }
 
+static int st_check(const char *name, DWORD r)
+{
+    int stack_ok = g_st_esp_after == g_st_esp_expected;
+    int pass = r == 0 && stack_ok;
+    cg_log("%s %s (EAX=%08lX, stack %s)", name, pass ? "PASS" : "FAIL", r,
+           stack_ok ? "balanced" : "NOT balanced");
+    return pass;
+}
+
 static DWORD WINAPI self_test_thread(void *arg)
 {
     static const BYTE load[] = { 0x8B, 0x41, 0x08, 0xC3 };
     static const BYTE call[] = { 0xFF, 0x50, 0x00, 0xC3 };
     DWORD disp, r, passed = 0;
+    cg_u32 args = 0;
     (void)arg;
     Sleep(10000);
     if (!gadget_ok(GADGET_LOAD, load, 4, 99) || !gadget_ok(GADGET_CALL, call, 4, 2)) {
@@ -917,27 +987,26 @@ static DWORD WINAPI self_test_thread(void *arg)
         return 0;
     }
     disp = ((const BYTE *)GADGET_CALL)[2];
-    cg_log("self-test: starting (deliberate faults in game code follow)");
+    if (g_cfg.correct_stack && !cg_call_arg_bytes(&g_env, GADGET_CALL, &args)) args = 0;
+    cg_log("self-test: starting (deliberate faults in game code follow; the call at %08X takes %lu arg bytes)",
+           GADGET_CALL, (DWORD)args);
 
     r = call_gadget(GADGET_LOAD, 0xDEADBEEF, UNMAPPED);
     cg_log("self-test 1/4 load from bad pointer:   %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
     passed += r == 0;
 
-    r = call_gadget(GADGET_CALL, UNMAPPED, 0);
-    cg_log("self-test 2/4 call via bad pointer:    %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
-    passed += r == 0;
+    r = call_gadget_args(GADGET_CALL, UNMAPPED, 0, args);
+    passed += st_check("self-test 2/4 call via bad pointer:   ", r);
 
     g_fake_vtable[disp / 4] = UNMAPPED;
-    r = call_gadget(GADGET_CALL, (DWORD)g_fake_vtable, 0xDEADBEEF);
-    cg_log("self-test 3/4 call into bad code:      %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
-    passed += r == 0;
+    r = call_gadget_args(GADGET_CALL, (DWORD)g_fake_vtable, 0xDEADBEEF, args);
+    passed += st_check("self-test 3/4 call into bad code:     ", r);
 
     if (g_cfg.recover_pure_calls && *(DWORD *)CRT_PURECALL_SLOT == (DWORD)purecall_stub) {
         /* the game's "call [eax+disp]" reaches _purecall, exactly like a real R6025 */
         g_fake_vtable[disp / 4] = CRT_PURECALL;
-        r = call_gadget(GADGET_CALL, (DWORD)g_fake_vtable, (DWORD)g_fake_vtable);
-        cg_log("self-test 4/4 pure virtual call:       %s (EAX=%08lX)", r == 0 ? "PASS" : "FAIL", r);
-        passed += r == 0;
+        r = call_gadget_args(GADGET_CALL, (DWORD)g_fake_vtable, (DWORD)g_fake_vtable, args);
+        passed += st_check("self-test 4/4 pure virtual call:      ", r);
     } else {
         cg_log("self-test 4/4 pure virtual call:       skipped (RecoverPureCalls=0)");
         passed++;
@@ -967,10 +1036,10 @@ static void startup(HMODULE self)
     cg_log("=== ChaseGuard " CG_VERSION_STR " started ===");
     cg_log("config: %s", g_ini_path);
     cg_log("EnablePatch=%d EnableHandler=%d RecoverFaults=%d RecoverBadCalls=%d RecoverPureCalls=%d "
-           "ZeroLoadedRegister=%d LoopLimit=%d MaxLogKB=%d SelfTest=%d",
+           "CorrectStack=%d ZeroLoadedRegister=%d LoopLimit=%d MaxLogKB=%d SelfTest=%d",
          g_cfg.enable_patch, g_cfg.enable_handler, g_cfg.recover_faults, g_cfg.recover_bad_calls,
-         g_cfg.recover_pure_calls, g_cfg.zero_loaded_reg, g_cfg.loop_limit, g_cfg.max_log_kb,
-         g_cfg.self_test);
+         g_cfg.recover_pure_calls, g_cfg.correct_stack, g_cfg.zero_loaded_reg, g_cfg.loop_limit,
+         g_cfg.max_log_kb, g_cfg.self_test);
 
     if (GetModuleHandleA("MWCrashFix.asi") || GetModuleHandleA("MWCrashFix.dll")) {
         cg_log("MWCrashFix is loaded as well - remove MWCrashFix.asi, only one of them must be installed");
@@ -1026,8 +1095,10 @@ static void startup(HMODULE self)
     g_env.recover_faults = g_cfg.recover_faults;
     g_env.recover_bad_calls = g_cfg.recover_bad_calls;
     g_env.zero_loaded_reg = g_cfg.zero_loaded_reg;
+    g_env.correct_stack = g_cfg.correct_stack;
     g_env.read = safe_read;
     g_env.read_user = 0;
+    g_env.text_image = (const cg_u8 *)g_text_begin;   /* speed.exe .text is mapped and readable */
     install_diagnostics();
 
     if (!g_cfg.enable_handler) {
