@@ -1,10 +1,10 @@
-# build artefacts and the base binary (not redistributed from this repo)
-orig.asi
-MWCrashFix.asi
-ChaseGuard.asi
-source/caves.o
-source/caves.elf
-source/caves.bin
-source/orig.asi
-source/MWCrashFix.asi
-source/ChaseGuard.asi
+# build output
+/build/
+*.obj
+*.o
+*.lib
+*.res
+*.asi
+*.zip
+# never commit game files
+speed.exe

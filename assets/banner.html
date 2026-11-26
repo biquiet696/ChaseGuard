@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<!-- Source of assets/banner.png (1920x1080). Render: open in Chrome at 1920x1080 or use any headless browser screenshot. Fonts: Poppins (Bold, Regular) and Inter (local font files). -->
+<html><head><meta charset="utf-8">
+<style>
+  @font-face { font-family: P; src: url('file:///usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf'); font-weight: 700; }
+  @font-face { font-family: P; src: url('file:///usr/share/fonts/truetype/google-fonts/Poppins-Regular.ttf'); font-weight: 400; }
+  html, body { margin: 0; padding: 0; }
+  body { width: 1920px; height: 1080px; overflow: hidden; position: relative; background: #0b1020; font-family: Inter, sans-serif; }
+  .bg { position: absolute; inset: 0;
+    background:
+      radial-gradient(ellipse 900px 700px at 0% 0%, rgba(150,22,40,.95), rgba(150,22,40,0) 70%),
+      radial-gradient(ellipse 700px 600px at 5% 100%, rgba(90,25,45,.55), rgba(90,25,45,0) 70%),
+      radial-gradient(ellipse 1000px 800px at 100% 10%, rgba(24,74,170,.95), rgba(24,74,170,0) 70%),
+      radial-gradient(ellipse 900px 600px at 100% 100%, rgba(20,45,100,.6), rgba(20,45,100,0) 70%),
+      linear-gradient(180deg, #0d1222 0%, #0b1020 50%, #0f172b 100%); }
+  .stripes { position: absolute; inset: 0;
+    background: repeating-linear-gradient(-60deg, rgba(255,255,255,0.028) 0 48px, rgba(0,0,0,0) 48px 108px); }
+  .bar { position: absolute; top: 0; height: 15px; border-radius: 0 0 8px 8px; }
+  .bar.red  { left: 0; width: 951px; background: #eb283c; box-shadow: 0 0 40px rgba(235,40,60,.55); }
+  .bar.blue { left: 970px; width: 950px; background: #2878ff; box-shadow: 0 0 40px rgba(40,120,255,.55); }
+  .shield { position: absolute; left: 820px; top: 160px; width: 280px; height: 340px; filter: drop-shadow(0 0 26px rgba(220,230,255,.45)); }
+  h1 { position: absolute; left: 0; right: 0; top: 640px; margin: 0; text-align: center;
+       font: 700 200px/1 P; letter-spacing: 13.3px; color: #f3f6ff; padding-left: 13.3px;
+       text-shadow: 0 10px 30px rgba(0,0,0,.6); }
+  .sub { position: absolute; left: 0; right: 0; top: 857px; text-align: center;
+         font: 400 44.6px/1.1 P; color: #b9c0e4; }
+  .badges { position: absolute; left: 0; right: 0; top: 935px; display: flex; justify-content: center; gap: 22px; }
+  .b { height: 63px; padding: 0 29px; border-radius: 32px; display: flex; align-items: center;
+       font: 600 33px/1 Inter; color: #fff; letter-spacing: .3px; }
+  .b.red  { background: #eb283c; }
+  .b.gray { background: #4e5a78; color: #f0f3ff; }
+  .b.blue { background: #2878ff; }
+  .foot { position: absolute; left: 0; right: 0; top: 1023px; text-align: center; font: 400 25px/1.2 Inter; color: #7381a3; }
+  .dot { margin: 0 14px; }
+</style></head>
+<body>
+  <div class="bg"></div><div class="stripes"></div>
+  <div class="bar red"></div><div class="bar blue"></div>
+  <svg class="shield" viewBox="0 0 280 340">
+    <defs><clipPath id="in"><path d="M140 26 L240 58 L240 190 Q240 246 140 312 Q40 246 40 190 L40 58 Z"/></clipPath></defs>
+    <path d="M140 14 L260 50 L260 192 Q258 262 140 330 Q22 262 20 192 L20 50 Z" fill="#f3f6ff"/>
+    <g clip-path="url(#in)">
+      <rect x="0" y="0" width="140" height="340" fill="#22121e"/>
+      <rect x="140" y="0" width="140" height="340" fill="#0c1934"/>
+    </g>
+    <path d="M70 162 L116 206 L196 106" fill="none" stroke="#f3f6ff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <h1>CHASEGUARD</h1>
+  <div class="sub">Pursuit crash protection for Need for Speed: Most Wanted (2005)</div>
+  <div class="badges">
+    <div class="b red">ASI PLUGIN</div>
+    <div class="b gray">GAME v1.3</div>
+    <div class="b gray">R6025 FIX</div>
+    <div class="b blue">v2.1.0</div>
+  </div>
+  <div class="foot">Based on MWCrashFix by x0reaxeax<span class="dot">·</span>GPL-3.0<span class="dot">·</span>Not affiliated with or endorsed by Electronic Arts</div>
+</body></html>
