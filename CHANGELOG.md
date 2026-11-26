@@ -1,6 +1,16 @@
 ChaseGuard changelog
 ====================
 
+2.0.2 - 2026-11-26
+
+  Added
+  * Quit diagnostics: the five places in speed.exe that end the game loop
+    (main-menu Quit, two menu message handlers, WM_CLOSE, WM_QUIT) are watched.
+    The log says which one closed the game, with the game call stack and the
+    last window events before it (focus changes, Alt+F4, SC_CLOSE, WM_CLOSE and
+    whether another program sent it). A "silent" close in the middle of a race
+    can now be told apart from a menu quit or a crash.
+
 2.0.1 - 2026-11-26
 
   Added

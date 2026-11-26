@@ -134,6 +134,7 @@ IMPORT PTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(PTOP_LEVEL
 IMPORT BOOL   WINAPI GetModuleHandleExA(DWORD flags, const char *name, HMODULE *module);
 #define GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT 0x2
 #define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS       0x4
+IMPORT DWORD  WINAPI InSendMessageEx(void *reserved);
 IMPORT int    WINAPI MessageBoxA(void *wnd, const char *text, const char *caption, unsigned type);
 IMPORT int    WINAPI wvsprintfA(char *out, const char *fmt, va_list_t args);
 

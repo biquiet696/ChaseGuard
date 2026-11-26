@@ -51,7 +51,8 @@ crash, and `chaseguard.log` gets a register dump.
 **3. Exit diagnostics.** Every way the game ends is logged with the game call stack: a normal quit (exit code 0),
 any C runtime error box (`R6025`, `R6018`, ...; `speed.exe` uses the debug CRT, so these appear as "Microsoft
 Visual C++ Debug Library - Debug Error!"), and unhandled crashes with the module they happened in (game, driver,
-another mod).
+another mod). If the game closes itself without an error, the log names the path that asked it to quit
+(menu, `WM_CLOSE` / Alt+F4, `WM_QUIT`) and the window events right before it.
 
 ## Settings (`ChaseGuard.ini`)
 

@@ -3,3 +3,4 @@ EXPORTS
 MessageBoxA@16
 wsprintfA
 wvsprintfA@12
+InSendMessageEx@4

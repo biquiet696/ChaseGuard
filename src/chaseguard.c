@@ -672,6 +672,8 @@ static int bytes_equal(DWORD addr, const BYTE *b, DWORD n)
     return 1;
 }
 
+static void install_quit_diagnostics(void);
+
 static void install_diagnostics(void)
 {
     static const BYTE purecall[] = { 0x55, 0x8B, 0xEC, 0x83, 0x3D, 0xF8, 0xA9, 0x9B, 0x00, 0x00 };
@@ -701,6 +703,176 @@ static void install_diagnostics(void)
     ok_uef = write_code(IAT_SET_UEF, &v, 4);
     cg_log("diagnostics: pure-call handler %s, runtime-error hook %s, exit hook %s, crash filter %s",
            ok_pure ? "on" : "OFF", ok_rt ? "on" : "OFF", ok_exit ? "on" : "OFF", ok_uef ? "on" : "OFF");
+    install_quit_diagnostics();
+}
+
+/* ------------------------------------------------------------------------------------------ */
+/* Quit diagnostics: who asked the game to close?                                              */
+/* The main loop ends the game when the flag at 0x9257EC is set. Five places set it; each one  */
+/* ("mov dword ptr [0x9257EC], 1", 10 bytes) is replaced by a call to quit_flag_stub, which     */
+/* logs the reason and sets the flag. The window procedure (0x6DB6C0) is hooked to remember    */
+/* recent window messages (focus, Alt+F4, close requests) for that log entry.                  */
+/* ------------------------------------------------------------------------------------------ */
+
+#define QUIT_FLAG     0x009257ECu
+#define GAME_WNDPROC  0x006DB6C0u
+#define WNDPROC_CONT  0x006DB6C6u
+
+typedef struct quit_site { DWORD addr; const char *reason; } quit_site;
+static const quit_site k_quit_sites[] = {
+    { 0x005A4C87u, "Quit confirmed in the main menu (Q -> Yes)" },
+    { 0x0057E667u, "quit requested by a game menu message (handler 0x57E630)" },
+    { 0x0055BE9Bu, "quit requested by a game menu message (handler 0x55BE90)" },
+    { 0x006DB7D4u, "the game window received WM_CLOSE" },
+    { 0x006C2206u, "the game received WM_QUIT (its window was destroyed or PostQuitMessage)" },
+};
+#define QUIT_SITE_COUNT (sizeof(k_quit_sites) / sizeof(k_quit_sites[0]))
+
+typedef struct wnd_event { DWORD tick, msg, wparam, lparam, sent; } wnd_event;
+#define WND_RING 16
+static wnd_event g_wnd_ring[WND_RING];
+static DWORD     g_wnd_count, g_focus_logs;
+static volatile LONG g_quit_logged;
+
+static const char *wnd_msg_name(DWORD m)
+{
+    switch (m) {
+    case 0x0002: return "WM_DESTROY";
+    case 0x0005: return "WM_SIZE";
+    case 0x0006: return "WM_ACTIVATE";
+    case 0x0008: return "WM_KILLFOCUS";
+    case 0x0010: return "WM_CLOSE";
+    case 0x0011: return "WM_QUERYENDSESSION";
+    case 0x0016: return "WM_ENDSESSION";
+    case 0x001C: return "WM_ACTIVATEAPP";
+    case 0x0104: return "WM_SYSKEYDOWN";
+    case 0x0112: return "WM_SYSCOMMAND";
+    default:     return 0;
+    }
+}
+
+static void describe_event(const wnd_event *e, char *out, DWORD cap)
+{
+    const char *extra = "";
+    if (e->msg == 0x0112 && (e->wparam & 0xFFF0) == 0xF060) extra = " = SC_CLOSE (Alt+F4, title bar or taskbar close)";
+    else if (e->msg == 0x0112 && (e->wparam & 0xFFF0) == 0xF020) extra = " = SC_MINIMIZE";
+    else if (e->msg == 0x0104 && e->wparam == 0x73) extra = " = Alt+F4 pressed";
+    else if (e->msg == 0x001C) extra = e->wparam ? " = game got focus" : " = game lost focus";
+    else if (e->msg == 0x0005 && e->wparam == 1) extra = " = minimized";
+    fmt(out, cap, "%s wParam=%08lX lParam=%08lX%s%s", wnd_msg_name(e->msg), e->wparam, e->lparam,
+        e->sent ? " (sent by another thread/program)" : "", extra);
+}
+
+/* Called for every message of the game window, before the game handles it. */
+__attribute__((used)) void __cdecl on_wnd_msg(const DWORD *args)   /* hwnd, msg, wparam, lparam */
+{
+    wnd_event e;
+    char text[200];
+    if (!wnd_msg_name(args[1])) return;
+    if (args[1] == 0x0104 && args[2] != 0x73) return;          /* only Alt+F4 among sys keys */
+    e.tick = GetTickCount();
+    e.msg = args[1]; e.wparam = args[2]; e.lparam = args[3];
+    e.sent = (InSendMessageEx(0) & 0x3) == 0x1;                  /* ISMEX_SEND (other thread) */
+    lock();
+    g_wnd_ring[g_wnd_count++ % WND_RING] = e;
+    unlock();
+    switch (e.msg) {
+    case 0x0010: case 0x0002: case 0x0011: case 0x0016:
+        describe_event(&e, text, sizeof(text));
+        cg_log("window: %s", text);
+        break;
+    case 0x0112:
+        if ((e.wparam & 0xFFF0) == 0xF060) { describe_event(&e, text, sizeof(text)); cg_log("window: %s", text); }
+        break;
+    case 0x0104:
+        describe_event(&e, text, sizeof(text)); cg_log("window: %s", text);
+        break;
+    case 0x001C:
+        if (g_focus_logs++ < 20) { describe_event(&e, text, sizeof(text)); cg_log("window: %s", text); }
+        break;
+    default:
+        break;
+    }
+}
+
+__declspec(naked) static void wndproc_stub(void)
+{
+    __asm__ volatile (
+        "pushfl\n\t"
+        "pushal\n\t"
+        "leal  40(%esp), %eax\n\t"      /* args: [esp at entry + 4] */
+        "pushl %eax\n\t"
+        "call  _on_wnd_msg\n\t"
+        "addl  $4, %esp\n\t"
+        "popal\n\t"
+        "popfl\n\t"
+        "pushl %ebx\n\t"                /* the replaced instructions */
+        "pushl %esi\n\t"
+        "movl  16(%esp), %esi\n\t"
+        "pushl $0x006DB6C6\n\t"
+        "ret\n\t");
+}
+
+__attribute__((used)) void __cdecl on_quit_flag(DWORD ret, DWORD esp_after)
+{
+    DWORD site = ret - 5, i, now = GetTickCount(), n;
+    const char *reason = "unknown place";
+    char text[200];
+    for (i = 0; i < QUIT_SITE_COUNT; i++) if (k_quit_sites[i].addr == site) reason = k_quit_sites[i].reason;
+    if (__sync_lock_test_and_set(&g_quit_logged, 1)) return;
+    cg_log("game asked to quit at %08lX: %s", site, reason);
+    log_game_stack(esp_after);
+    lock();
+    n = g_wnd_count < WND_RING ? g_wnd_count : WND_RING;
+    unlock();
+    if (n) cg_log("  last window events (oldest first):");
+    for (i = 0; i < n; i++) {
+        const wnd_event *e = &g_wnd_ring[(g_wnd_count - n + i) % WND_RING];
+        describe_event(e, text, sizeof(text));
+        cg_log("    %lu ms ago: %s", now - e->tick, text);
+    }
+}
+
+/* Replaces "mov dword ptr [0x9257EC], 1" at the five quit sites (call + 5 nops). */
+__declspec(naked) static void quit_flag_stub(void)
+{
+    __asm__ volatile (
+        "pushfl\n\t"
+        "pushal\n\t"
+        "leal  40(%esp), %eax\n\t"      /* esp of the game code after our return */
+        "pushl %eax\n\t"
+        "pushl 40(%esp)\n\t"            /* return address (after the 5-byte call) */
+        "call  _on_quit_flag\n\t"
+        "addl  $8, %esp\n\t"
+        "popal\n\t"
+        "popfl\n\t"
+        "movl  $1, 0x009257EC\n\t"
+        "ret\n\t");
+}
+
+static void install_quit_diagnostics(void)
+{
+    static const BYTE flag_insn[] = { 0xC7, 0x05, 0xEC, 0x57, 0x92, 0x00, 0x01, 0x00, 0x00, 0x00 };
+    static const BYTE wndproc[]   = { 0x53, 0x56, 0x8B, 0x74, 0x24, 0x10 };
+    BYTE patch[10];
+    DWORD i, j, hooked = 0;
+    int ok_wnd = 0;
+    for (i = 0; i < QUIT_SITE_COUNT; i++) {
+        DWORD a = k_quit_sites[i].addr;
+        if (!bytes_equal(a, flag_insn, sizeof(flag_insn))) continue;
+        patch[0] = 0xE8;
+        *(DWORD *)(patch + 1) = (DWORD)quit_flag_stub - (a + 5);
+        for (j = 5; j < 10; j++) patch[j] = 0x90;
+        hooked += write_code(a, patch, sizeof(patch));
+    }
+    if (bytes_equal(GAME_WNDPROC, wndproc, sizeof(wndproc))) {
+        patch[0] = 0xE9;
+        *(DWORD *)(patch + 1) = (DWORD)wndproc_stub - (GAME_WNDPROC + 5);
+        patch[5] = 0x90;
+        ok_wnd = write_code(GAME_WNDPROC, patch, 6);
+    }
+    cg_log("diagnostics: %lu/%u quit paths watched, window messages %s",
+           hooked, (unsigned)QUIT_SITE_COUNT, ok_wnd ? "watched" : "NOT watched");
 }
 
 /* ------------------------------------------------------------------------------------------ */
